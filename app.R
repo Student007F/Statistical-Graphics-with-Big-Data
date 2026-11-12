@@ -1,1224 +1,1132 @@
-# ============================================================
-# CHIPMUNK - Shoe Search with Principal Component Analysis
-# Combined version of app.R and app(1).R
-# All interface text, messages, and comments are in English.
-# ============================================================
-
-# 1. PACKAGES AND SETTINGS -----------------------------------
-required_packages <- c("shiny", "bslib", "png", "magick")
-missing_packages <- required_packages[
-  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
-]
-if (length(missing_packages) > 0) {
-  stop(
-    "Install the missing packages first: install.packages(c(",
-    paste(sprintf('"%s"', missing_packages), collapse = ", "),
-    "))"
-  )
-}
-
+# Project 2 template: the tabs and the inputs only. Everything else, and the look of the app, is yours.
 library(shiny)
+library(dplyr)
+library(ggplot2)
 library(bslib)
-library(png)
+
+# Example: read one photo as 4,096 numbers (64 x 64 grayscale, row by row, 0 = black to 255 = white)
 library(magick)
-options(shiny.maxRequestSize = 30 * 1024^2)
 
-IMAGE_SIDE <- 64L
-PIXEL_COUNT <- IMAGE_SIDE * IMAGE_SIDE
-NEIGHBORS <- 5L
-MAX_PCS <- 100L
-CACHE_FILE <- "pca_cache_unified_v2.rds"
-CACHE_VERSION <- "column-major-png-grayscale-v2"
+# 1. 메타데이터 읽기 (id와 category가 들어있는 파일)
+meta <- read.csv("shoes_meta.csv")
 
-# 2. CATALOGUE DATA ------------------------------------------
-if (!file.exists("shoes_meta.csv")) {
-  stop("Missing shoes_meta.csv. Put it in the same folder as app.R.")
+# 2. 2,000장의 신발 이미지를 한 번에 읽어서 행렬(Matrix)로 만드는 함수
+load_all_shoes <- function() {
+  img_list <- lapply(1:2000, function(i) {
+    path <- file.path("shoes", sprintf("%04d.png", i))
+    img <- image_read(path)
+    # 64x64 흑백 이미지로 변환 후 숫자 벡터(0~255)로 바꿈
+    as.numeric(t(matrix(as.integer(image_data(img, channels = "gray")), 64, 64)))
+  })
+  # ★ 핵심: 리스트들을 2000행 x 4096열의 행렬(Matrix)로 묶어서 반환합니다!
+  shoe_mat <- do.call(rbind, img_list)
+  return(shoe_mat)
 }
 
-shoes_meta <- read.csv("shoes_meta.csv", stringsAsFactors = FALSE)
-if (!all(c("id", "category") %in% names(shoes_meta))) {
-  stop("shoes_meta.csv must contain columns named 'id' and 'category'.")
+#앱이 켜질 때 딱 한 번만 실행되도록 여기에 두는 것입니다.
+cat("Loading shoe images... please wait.\n")
+shoe_matrix <- load_all_shoes()
+cat("Images loaded.\n")
+
+# 3. 평균 신발(x_bar) 계산 및 PCA(주성분 분석) 실행
+x_bar <- colMeans(shoe_matrix)
+pca_result <- prcomp(shoe_matrix, center = TRUE, scale. = FALSE)
+
+# [수정 1] 어떤 사진(JPG/PNG, 가로·세로 무엇이든)이든 카탈로그와 같은 형식의 벡터로 바꾸는 함수
+#   - 휴대폰 사진의 회전 정보 적용 → 투명 배경은 흰색으로 → 흰색을 채워 정사각형으로
+#     (신발이 안 찌그러지고 안 잘림) → 64x64 → 흑백 → 0~255 숫자 4096개
+load_any <- function(path) {
+  img <- image_read(path)[1]                              # 여러 프레임이면 첫 장만
+  img <- image_orient(img)                                # 휴대폰 사진의 회전(EXIF) 적용
+  img <- image_background(img, "white", flatten = TRUE)   # 투명 배경 -> 흰색
+  info <- image_info(img)
+  s <- max(info$width, info$height)                       # 긴 변 기준 정사각형
+  img <- image_extent(img, paste0(s, "x", s), gravity = "center", color = "white")  # 남는 곳은 흰색으로 채움 (자르지 않음)
+  img <- image_resize(img, "64x64!")                      # 이미 정사각형이라 비율이 안 깨짐
+  img <- image_convert(img, colorspace = "gray")          # 흑백으로
+  as.numeric(t(matrix(as.integer(image_data(img, channels = "gray")), 64, 64)))
 }
 
-shoes_meta$id <- suppressWarnings(as.integer(as.character(shoes_meta$id)))
-shoes_meta$category <- trimws(as.character(shoes_meta$category))
-if (anyNA(shoes_meta$id) || anyDuplicated(shoes_meta$id) ||
-    anyNA(shoes_meta$category) || any(!nzchar(shoes_meta$category))) {
-  stop("Catalogue IDs must be unique integers and categories must not be empty.")
-}
-if (nrow(shoes_meta) <= NEIGHBORS) {
-  stop("The catalogue must have at least six images for five-neighbor search.")
+# [수정 5] 예측 동점 규칙: 최다 득표 카테고리가 여러 개면, 그중 가장 가까운 사진의 카테고리를 선택
+#   top5는 거리순으로 정렬되어 있으므로, 위에서부터 처음 만나는 동점 카테고리가 가장 가까운 사진의 것
+predict_cat <- function(top5) {
+  tb   <- table(top5$Category)
+  tied <- names(tb)[tb == max(tb)]                # 최다 득표 카테고리들 (동점이면 2개)
+  top5$Category[top5$Category %in% tied][1]
 }
 
-catalogue_paths <- file.path("shoes", sprintf("%04d.png", shoes_meta$id))
-missing_images <- catalogue_paths[!file.exists(catalogue_paths)]
-if (length(missing_images) > 0) {
-  stop("Catalogue images are missing. First missing file: ", missing_images[1])
-}
+# [수정 9] K별 예측 정확도 (leave-one-out): 카탈로그 2,000장 각각을 "자기 자신만 빼고" 검색해서
+#   top 5 다수결(동점이면 가장 가까운 사진)로 카테고리를 예측하고, 실제 카테고리와 비교
+#   -> 정답(카테고리)을 아는 카탈로그 사진에만 가능. 한 번 계산하면 acc_cache에 저장해서 다시 계산하지 않음.
+acc_cache <- new.env()
 
-category_levels <- sort(unique(shoes_meta$category))
-category_colors <- setNames(
-  grDevices::hcl.colors(length(category_levels), palette = "Dark 3"),
-  category_levels
-)
-
-# 3. IMAGE PREPROCESSING -------------------------------------
-# IMPORTANT: Both catalogue and external images become column-major
-# 64 x 64 grayscale vectors, using png::readPNG as the final decoder.
-# Do not mix this representation with a row-major magick vector.
-read_png_vector <- function(path) {
-  img <- png::readPNG(path)
-  dims <- dim(img)
+compute_loo_acc <- function(progress = function(k) NULL, max_k = 100) {
+  if (!is.null(acc_cache$res)) return(acc_cache$res)
+  S     <- pca_result$x
+  n     <- nrow(S)
+  cat_f <- factor(meta$category)
+  truth <- as.integer(cat_f)
+  n_cat <- nlevels(cat_f)
+  D2      <- matrix(0, n, n)                       # 제곱 거리 (PC를 하나씩 더하며 누적)
+  overall <- numeric(max_k)
+  by_cat  <- matrix(NA_real_, max_k, n_cat, dimnames = list(NULL, levels(cat_f)))
   
-  if (length(dims) == 3L) {
-    if (dims[3] >= 3L) {
-      # Convert color PNGs to grayscale; catalogue files are normally gray.
-      gray <- 0.2126 * img[, , 1] +
-        0.7152 * img[, , 2] +
-        0.0722 * img[, , 3]
-      if (dims[3] >= 4L) {
-        alpha <- img[, , 4]
-        gray <- gray * alpha + (1 - alpha)  # White background
-      }
-      img <- gray
-    } else {
-      img <- img[, , 1]
-    }
-  }
-  
-  if (!identical(dim(img), c(IMAGE_SIDE, IMAGE_SIDE))) {
-    stop("Expected a 64 x 64 PNG: ", path)
-  }
-  as.numeric(round(pmax(0, pmin(1, img)) * 255))
-}
-
-read_external_vector <- function(path) {
-  # Convert real photographs in a consistent way: orient, flatten alpha,
-  # pad to a square without stretching, resize and convert to grayscale.
-  img <- magick::image_read(path)[1]
-  dims <- magick::image_info(img)
-  
-  # An existing 64x64 PNG should remain pixel-exact. This also works for
-  # Shiny temporary uploads whose paths have no .png file extension.
-  if (dims$width[1] == IMAGE_SIDE && dims$height[1] == IMAGE_SIDE) {
-    exact_png <- tryCatch(png::readPNG(path), error = function(e) NULL)
-    if (!is.null(exact_png)) return(read_png_vector(path))
-  }
-  
-  img <- magick::image_orient(img)
-  img <- magick::image_background(img, "white", flatten = TRUE)
-  dims <- magick::image_info(img)
-  side <- max(dims$width[1], dims$height[1])
-  img <- magick::image_extent(
-    img, geometry = paste0(side, "x", side),
-    gravity = "center", color = "white"
-  )
-  img <- magick::image_resize(img, "64x64!")
-  img <- magick::image_convert(img, colorspace = "gray")
-  
-  temporary_png <- tempfile(fileext = ".png")
-  on.exit(unlink(temporary_png), add = TRUE)
-  magick::image_write(img, path = temporary_png, format = "png", depth = 8)
-  read_png_vector(temporary_png)
-}
-
-save_vector_png <- function(vector) {
-  stopifnot(length(vector) == PIXEL_COUNT)
-  values <- pmax(0, pmin(255, as.numeric(vector))) / 255
-  image_matrix <- matrix(values, nrow = IMAGE_SIDE, ncol = IMAGE_SIDE)
-  destination <- tempfile(fileext = ".png")
-  png::writePNG(image_matrix, destination)
-  destination
-}
-
-# Match a self-check filename to its optional ground-truth label.
-read_selfcheck_label <- function(filename) {
-  path <- file.path("selfcheck", "labels.csv")
-  if (!file.exists(path)) return(NA_character_)
-  
-  labels <- tryCatch(read.csv(path, stringsAsFactors = FALSE),
-                     error = function(e) NULL)
-  if (is.null(labels) || nrow(labels) == 0L) return(NA_character_)
-  
-  headers <- tolower(names(labels))
-  file_col <- match(TRUE, headers %in% c(
-    "file", "filename", "file_name", "image", "photo", "name", "id"
-  ))
-  cat_col <- match(TRUE, headers %in% c("category", "label", "class"))
-  if (is.na(file_col) || is.na(cat_col)) return(NA_character_)
-  
-  normalize_filename <- function(x) {
-    x <- tolower(tools::file_path_sans_ext(basename(as.character(x))))
-    sub("^selfcheck_0*", "", x)
-  }
-  row_index <- match(normalize_filename(filename),
-                     normalize_filename(labels[[file_col]]))
-  if (is.na(row_index)) return(NA_character_)
-  
-  value <- trimws(as.character(labels[[cat_col]][row_index]))
-  if (is.na(value) || !nzchar(value)) return(NA_character_)
-  known <- match(tolower(value), tolower(category_levels))
-  if (is.na(known)) return(value)
-  category_levels[known]
-}
-
-# 4. PCA WITH A VERSIONED, VALIDATED CACHE --------------------
-# Changing the processing algorithm or source files invalidates the cache.
-info <- file.info(catalogue_paths)
-cache_manifest <- list(
-  version = CACHE_VERSION,
-  ids = shoes_meta$id,
-  categories = shoes_meta$category,
-  sizes = as.numeric(info$size),
-  modified = as.numeric(info$mtime)
-)
-
-cached <- if (file.exists(CACHE_FILE)) {
-  tryCatch(readRDS(CACHE_FILE), error = function(e) NULL)
-} else {
-  NULL
-}
-
-cache_ok <- is.list(cached) && identical(cached$manifest, cache_manifest) &&
-  is.matrix(cached$X) && nrow(cached$X) == nrow(shoes_meta) &&
-  ncol(cached$X) == PIXEL_COUNT &&
-  is.matrix(cached$loadings) && is.matrix(cached$scores) &&
-  length(cached$x_bar) == PIXEL_COUNT &&
-  nrow(cached$scores) == nrow(shoes_meta) &&
-  ncol(cached$scores) == ncol(cached$loadings) &&
-  length(cached$var_explained) == ncol(cached$loadings)
-
-# Spot-check actual pixels even when the cache metadata appears unchanged.
-# This catches a cache built with a different pixel order or decoder.
-if (cache_ok) {
-  probes <- unique(c(1L, ceiling(nrow(shoes_meta) / 2), nrow(shoes_meta)))
-  cache_ok <- all(vapply(probes, function(i) {
-    identical(as.numeric(cached$X[i, ]), read_png_vector(catalogue_paths[i]))
-  }, logical(1)))
-}
-
-if (cache_ok) {
-  message("Loading validated PCA cache: ", CACHE_FILE)
-  pca_data <- cached
-} else {
-  message("Building PCA catalogue from ", nrow(shoes_meta), " images...")
-  X <- t(vapply(catalogue_paths, read_png_vector, numeric(PIXEL_COUNT)))
-  x_bar <- colMeans(X)
-  centered <- sweep(X, 2, x_bar, "-")
-  components <- min(MAX_PCS, nrow(X) - 1L, ncol(X))
-  
-  # PCA without variance scaling: brightness/shape variation is preserved.
-  decomposition <- svd(centered, nu = 0L, nv = components)
-  loadings <- decomposition$v[, seq_len(components), drop = FALSE]
-  scores <- centered %*% loadings
-  explained <- 100 * decomposition$d[seq_len(components)]^2 /
-    sum(decomposition$d^2)
-  
-  pca_data <- list(
-    manifest = cache_manifest,
-    X = X,
-    x_bar = x_bar,
-    loadings = loadings,
-    scores = scores,
-    var_explained = explained
-  )
-  saveRDS(pca_data, CACHE_FILE)
-  message("PCA cache saved to ", CACHE_FILE)
-}
-
-K_MAX <- ncol(pca_data$loadings)
-stopifnot(K_MAX >= 2L)
-
-# 5. MATCHING, RECONSTRUCTION, AND ACCURACY -------------------
-predict_from_categories <- function(categories_in_distance_order) {
-  counts <- table(categories_in_distance_order)
-  tied <- names(counts)[counts == max(counts)]
-  # Because neighbors are already sorted, the nearest tied class wins.
-  categories_in_distance_order[
-    which(categories_in_distance_order %in% tied)[1]
-  ]
-}
-
-find_similar_shoes <- function(query_vector, K, exclude_id = NULL) {
-  stopifnot(length(query_vector) == PIXEL_COUNT,
-            K >= 1L, K <= K_MAX)
-  indices <- seq_len(K)
-  V <- pca_data$loadings[, indices, drop = FALSE]
-  query_scores <- as.numeric((query_vector - pca_data$x_bar) %*% V)
-  catalogue_scores <- pca_data$scores[, indices, drop = FALSE]
-  distance_squared <- rowSums(sweep(catalogue_scores, 2, query_scores, "-")^2)
-  
-  if (!is.null(exclude_id)) {
-    excluded_row <- match(as.integer(exclude_id), shoes_meta$id)
-    if (!is.na(excluded_row)) distance_squared[excluded_row] <- Inf
-  }
-  
-  nearest <- order(distance_squared)[seq_len(NEIGHBORS)]
-  results <- data.frame(
-    Rank = seq_len(NEIGHBORS),
-    ID = shoes_meta$id[nearest],
-    Category = shoes_meta$category[nearest],
-    Distance = round(sqrt(distance_squared[nearest]), 2),
-    row.names = NULL
-  )
-  list(
-    best_id = results$ID[1],
-    top5 = results,
-    prediction = predict_from_categories(results$Category),
-    query_scores = query_scores
-  )
-}
-
-reconstruct_shoe <- function(vector, K) {
-  V <- pca_data$loadings[, seq_len(K), drop = FALSE]
-  q <- as.numeric((vector - pca_data$x_bar) %*% V)
-  as.numeric(pca_data$x_bar + V %*% q)
-}
-
-# Plot in the same orientation as png::writePNG: top-left pixel stays top-left.
-plot_shoe <- function(vector, title = "", signed = FALSE) {
-  m <- matrix(as.numeric(vector), IMAGE_SIDE, IMAGE_SIDE)
-  z <- t(m[IMAGE_SIDE:1L, , drop = FALSE])
-  
-  if (signed) {
-    bound <- max(abs(vector))
-    if (!is.finite(bound) || bound == 0) bound <- 1
-    palette <- grDevices::colorRampPalette(
-      c("#245A9C", "#FFFFFF", "#C64342")
-    )(201)
-    limits <- c(-bound, bound)
-  } else {
-    palette <- gray(seq(0, 1, length.out = 256))
-    limits <- c(0, 255)
-  }
-  
-  image(
-    x = seq_len(IMAGE_SIDE), y = seq_len(IMAGE_SIDE), z = z,
-    col = palette, zlim = limits,
-    axes = FALSE, xlab = "", ylab = "", asp = 1,
-    main = title, useRaster = TRUE
-  )
-}
-
-# Optional, expensive computation: leave one catalogue image out, then
-# classify it using its five closest remaining neighbours at each K.
-accuracy_cache <- new.env(parent = emptyenv())
-compute_loo_accuracy <- function(progress_callback = function(k) NULL) {
-  if (exists("results", envir = accuracy_cache, inherits = FALSE)) {
-    return(get("results", envir = accuracy_cache, inherits = FALSE))
-  }
-  
-  S <- pca_data$scores
-  n <- nrow(S)
-  truth_factor <- factor(shoes_meta$category, levels = category_levels)
-  truth <- as.integer(truth_factor)
-  category_count <- length(category_levels)
-  D2 <- matrix(0, n, n)
-  overall <- numeric(K_MAX)
-  by_category <- matrix(
-    NA_real_, nrow = K_MAX, ncol = category_count,
-    dimnames = list(NULL, category_levels)
-  )
-  
-  for (k in seq_len(K_MAX)) {
-    D2 <- D2 + outer(S[, k], S[, k], "-")^2
-    diag(D2) <- Inf
-    
-    neighbor_rows <- t(vapply(seq_len(n), function(i) {
-      row_distances <- D2[i, ]
-      threshold <- sort.int(row_distances, partial = NEIGHBORS)[NEIGHBORS]
-      candidates <- which(row_distances <= threshold)
-      candidates[order(row_distances[candidates], candidates)][seq_len(NEIGHBORS)]
-    }, integer(NEIGHBORS)))
-    
-    predicted <- vapply(seq_len(n), function(i) {
-      neighbor_classes <- truth[neighbor_rows[i, ]]
-      counts <- tabulate(neighbor_classes, nbins = category_count)
-      tied <- which(counts == max(counts))
-      neighbor_classes[which(neighbor_classes %in% tied)[1]]
+  for (k in 1:max_k) {
+    D2 <- D2 + outer(S[, k], S[, k], "-")^2        # PC k까지 쓴 제곱 거리
+    Dk <- D2
+    diag(Dk) <- Inf                                # 자기 자신 제외
+    # 각 사진마다 가장 가까운 5장의 위치 (거리순)
+    idx <- t(apply(Dk, 1, function(d) {
+      thr  <- sort.int(d, partial = 5)[5]
+      cand <- which(d <= thr)
+      cand[order(d[cand])][1:5]
+    }))
+    N <- matrix(truth[idx], nrow = n)              # 이웃 5장의 카테고리 번호
+    pred <- vapply(seq_len(n), function(i) {       # 다수결, 동점이면 가장 가까운 이웃의 카테고리
+      nb   <- N[i, ]
+      cnt  <- tabulate(nb, nbins = n_cat)
+      tied <- which(cnt == max(cnt))
+      as.integer(nb[nb %in% tied][1])
     }, integer(1))
-    
-    correct <- predicted == truth
-    overall[k] <- mean(correct)
-    by_category[k, ] <- vapply(seq_len(category_count), function(j) {
-      mean(correct[truth == j])
-    }, numeric(1))
-    progress_callback(k)
+    ok <- (pred == truth)
+    overall[k] <- mean(오케이)
+    by_cat[k, ] <- tapply(ok, factor(truth, levels = 1:n_cat), mean)
+    progress(k)
   }
-  
-  result <- list(K = seq_len(K_MAX), overall = overall, by_cat = by_category)
-  assign("results", result, envir = accuracy_cache)
-  result
+  acc_cache$res <- list(K = 1:max_k, overall = overall, by_cat = by_cat)
+  acc_cache$res
 }
 
-# 6. PERSONAL SHOE DATA --------------------------------------
-parse_our_filename <- function(filename) {
-  parts <- strsplit(
-    tools::file_path_sans_ext(basename(filename)), "_", fixed = TRUE
-  )[[1]]
-  member <- if (length(parts) >= 1L) parts[1] else "Unknown"
-  category <- if (length(parts) >= 2L) parts[2] else NA_character_
-  matching <- match(tolower(category), tolower(category_levels))
-  category <- if (is.na(matching)) NA_character_ else category_levels[matching]
-  list(name = member, category = category)
+# [수정 11] Our Shoes ------------------------------------------------------------
+# 임의의 사진 벡터(길이 4096)에 대해 가장 가까운 카탈로그 5장을 찾는 함수 (Shoe Search와 같은 계산)
+#   (이름을 search로 하면 R 기본 함수 search()를 가리므로 find_top5로 함)
+find_top5 <- function(vec, K) {
+  q  <- as.vector((vec - x_bar) %*% pca_result$rotation[, 1:K])
+  cs <- pca_result$x[, 1:K, drop = FALSE]
+  d  <- sqrt(rowSums((cs - matrix(q, nrow(cs), K, byrow = TRUE))^2))
+  top <- order(d)[1:5]
+  data.frame(Rank = 1:5, ID = top, Category = meta$category[top], Distance = round(d[top], 2))
 }
 
-empty_our <- function() {
-  list(
-    df = data.frame(
-      file = character(), name = character(), category = character(),
-      stringsAsFactors = FALSE
-    ),
-    X = matrix(numeric(0), nrow = 0L, ncol = PIXEL_COUNT)
-  )
+# 0~255 벡터를 64x64 흑백 그림으로 그리는 함수 (정사각형 비율, 밝기 범위 고정)
+draw_gray <- function(vec, main = "", sub = "") {
+  m <- matrix(vec, 64, 64, byrow = TRUE)
+  image(t(apply(m, 2, rev)), col = gray(0:100/100), zlim = c(0, 255), axes = FALSE, asp = 1,
+        main = main, sub = sub)
 }
 
-load_folder_shoes <- function() {
-  result <- empty_our()
-  if (!dir.exists("ourshoes")) return(result)
-  filenames <- sort(list.files(
-    "ourshoes", pattern = "\\.(png|jpg|jpeg)$", ignore.case = TRUE
-  ))
-  
-  for (filename in filenames) {
-    vector <- tryCatch(
-      read_external_vector(file.path("ourshoes", filename)),
-      error = function(e) {
-        warning("Skipping unreadable personal shoe photo: ", filename)
-        NULL
-      }
-    )
-    if (is.null(vector)) next
-    details <- parse_our_filename(filename)
-    result$df <- rbind(result$df, data.frame(
-      file = filename, name = details$name,
-      category = details$category, stringsAsFactors = FALSE
-    ))
-    result$X <- rbind(result$X, vector)
-  }
-  result
-}
-
-initial_our <- load_folder_shoes()
-selfcheck_files <- if (dir.exists("selfcheck")) {
-  sort(list.files("selfcheck", pattern = "\\.(png|jpg|jpeg)$",
-                  ignore.case = TRUE))
+# ourshoes/ 폴더의 사진 읽기. 파일 이름 규칙: 이름_카테고리_번호.jpg (예: Whae_Sandals_1.jpg)
+cat_levels <- sort(unique(meta$category))
+our_files  <- list.files("ourshoes", pattern = "\\.(jpg|jpeg|png)$", ignore.case = TRUE)
+if (length(our_files) > 0) {
+  parts <- strsplit(tools::file_path_sans_ext(our_files), "_")
+  our <- data.frame(
+    file     = our_files,
+    name     = vapply(parts, function(p) p[1], character(1)),
+    category = vapply(parts, function(p) if (length(p) >= 2) p[2] else NA_character_, character(1)),
+    stringsAsFactors = FALSE)
+  our$category <- cat_levels[match(tolower(our$category), tolower(cat_levels))]   # Boots/Sandals/Shoes/Slippers로 통일 (오타면 NA)
+  our_mat <- t(sapply(file.path("ourshoes", our$file), load_any))
+  rownames(our_mat) <- NULL
 } else {
-  character(0)
+  our <- data.frame(file = character(), name = character(), category = character(), stringsAsFactors = FALSE)
+  our_mat <- NULL
 }
 
-# 7. USER INTERFACE ------------------------------------------
-# A scrollable content panel for each top-level navigation tab.
-# The navbar remains visible; only the selected tab content scrolls.
-scroll_tab <- function(...) {
-  div(class = "chipmunk-scroll-pane", ...)
+# img <- image_read("shoes/0001.png")
+# x <- as.numeric(t(matrix(as.integer(image_data(img, channels = "gray")), 64, 64)))
+
+# ============================================================
+# Finding A / B 용 데이터 읽기 + 공통 보조 함수
+#   CSV(kpop_lyrics_counts.csv)는 app.R 과 같은 폴더, 또는 그 안의 data 폴더에 둡니다.
+# ============================================================
+LYRICS_FILE <- if (file.exists("kpop_lyrics_counts.csv")) "kpop_lyrics_counts.csv" else "data/kpop_lyrics_counts.csv"
+if (!file.exists(LYRICS_FILE)) stop("kpop_lyrics_counts.csv 가 없습니다. app.R 과 같은 폴더(또는 data 폴더)에 두세요.")
+
+# Load K-pop lyrics data
+lyrics <- read.csv(LYRICS_FILE)
+
+# Remove rows with missing English percentages
+lyrics <- lyrics %>%
+  mutate(
+    is_hive = tolower(trimws(as.character(is_hive)))
+  ) %>%
+  filter(!is.na(pct_main))
+
+# 카운팅 규칙 3가지와 CSV 열 이름의 연결 (Finding A, B에서 사용)
+RULE_COLS <- c(main = "pct_main", sub_1 = "pct_sub_1", sub_2 = "pct_sub_2")
+if (!all(RULE_COLS %in% names(lyrics))) {
+  stop("CSV에 없는 열: ", paste(setdiff(RULE_COLS, names(lyrics)), collapse = ", "))
+}
+RULE_CHOICES <- c("main: all English words" = "main",
+                  "sub_1: without English fillers (ad-libs)" = "sub_1",
+                  "sub_2: a repeated word counts once per song" = "sub_2")
+
+# 곡 표를 "규칙 x 집단" 기준으로 만들어 주는 함수
+#   d    : 연도 등으로 이미 걸러 둔 lyrics
+#   rules: 선택한 규칙 이름 (예: c("main", "sub_2"))
+#   split: TRUE 면 HYBE / Non-HYBE 로 나누고, FALSE 면 전체 곡을 하나로 봄
+#   반환 : 규칙마다 곡을 한 번씩 복사한 표. pct = 그 규칙의 영어 비중, series = 그래프에서 선·막대를 나누는 이름
+make_long <- function(d, rules, split) {
+  if (split) {
+    d$group <- ifelse(d$is_hive == "true", "HYBE", "Non-HYBE")
+  } else {
+    d$group <- rep("All songs", nrow(d))
+  }
+  long <- bind_rows(lapply(rules, function(r) {
+    x <- d
+    x$rule <- rep(r, nrow(x))
+    x$pct  <- x[[RULE_COLS[[r]]]]
+    x
+  }))
+  if (length(rules) > 1 && split) {
+    long$series <- paste0(long$rule, " / ", long$group)
+  } else if (length(rules) > 1) {
+    long$series <- long$rule
+  } else {
+    long$series <- long$group
+  }
+  ord <- order(match(long$rule, names(RULE_COLS)), long$group)
+  long$series <- factor(long$series, levels = unique(long$series[ord]))
+  long
 }
 
-shoe_image_card <- function(title, output_id) {
-  card(
-    fill = FALSE,
-    card_header(title),
-    card_body(fill = FALSE, fillable = FALSE,
-              imageOutput(output_id, width = "100%", height = "auto"))
-  )
+# 상단 통계 상자(대시보드). s = series별 요약표, thr 가 있으면 "기준 이상 곡 비율" 상자를 하나 더 보여 줌
+stat_box <- function(title, value, w) {
+  column(w, wellPanel(h4(title), h3(value)))
+}
+stat_rows <- function(s, thr = NULL) {
+  w <- if (is.null(thr)) 4 else 3
+  rows <- lapply(seq_len(nrow(s)), function(i) {
+    boxes <- list(
+      stat_box("Number of Songs", s$n[i], w),
+      stat_box("Mean English Percentage", round(s$mean_pct[i], 2), w),
+      stat_box("Median English Percentage", round(s$median_pct[i], 2), w)
+    )
+    if (!is.null(thr)) {
+      boxes[[4]] <- stat_box(paste0("Songs with at least ", thr, "% English"),
+                             paste0(round(s$share_thr[i], 1), "%"), w)
+    }
+    tagList(
+      if (nrow(s) > 1) h5(as.character(s$series[i])),
+      do.call(fluidRow, boxes)
+    )
+  })
+  tagList(rows)
 }
 
-ui <- page_navbar(
-  title = "Chipmunk | Shoe PCA",
-  theme = bs_theme(version = 5, bootswatch = "flatly"),
-  # Keep the navbar and active tab fitted to the browser viewport.
-  fillable = TRUE,
-  fillable_mobile = TRUE,
-  padding = 0,
-  header = tags$head(tags$style(HTML(" 
-    /* App window: top navigation is always visible. */
-    html { height: 100%; }
-    body.bslib-page-navbar {
-      height: 100vh;
-      height: 100dvh;
-      max-height: 100dvh;
-      min-height: 0;
-      overflow: hidden !important;
-      display: flex;
-      flex-direction: column;
-    }
-    body.bslib-page-navbar > .navbar {
-      flex: 0 0 auto;
-      z-index: 1030;
-    }
-    /* bslib's content container fills the space below the navbar. */
-    body.bslib-page-navbar > .container,
-    body.bslib-page-navbar > .container-fluid {
-      min-height: 0;
-      flex: 1 1 auto;
-      overflow: hidden;
-    }
-    body.bslib-page-navbar .tab-content {
-      min-height: 0;
-      flex: 1 1 auto;
-      overflow: hidden;
-    }
-    body.bslib-page-navbar .tab-content > .tab-pane {
-      min-height: 0;
-      max-height: 100%;
-      overflow: hidden;
-    }
-    body.bslib-page-navbar .tab-content > .tab-pane.active {
-      display: flex;
-      flex-direction: column;
-      height: 100%;
-    }
-    /* Independent scrollbar on the right of the selected tab. */
-    .chipmunk-scroll-pane {
-      flex: 1 1 auto;
-      width: 100%;
-      height: 100%;
-      min-height: 0;
-      overflow-y: auto;
-      overflow-x: hidden;
-      overscroll-behavior-y: contain;
-      scrollbar-gutter: stable;
-      scrollbar-width: thin;
-      scrollbar-color: #93a7b4 #edf2f5;
-      padding: 18px 22px 28px;
-    }
-    .chipmunk-scroll-pane::-webkit-scrollbar { width: 10px; }
-    .chipmunk-scroll-pane::-webkit-scrollbar-track { background: #edf2f5; }
-    .chipmunk-scroll-pane::-webkit-scrollbar-thumb {
-      background: #93a7b4;
-      border-radius: 8px;
-      border: 2px solid #edf2f5;
-    }
-    @media (max-width: 767px) {
-      .chipmunk-scroll-pane { padding: 12px 12px 24px; }
-    }
-    .bslib-card { margin-bottom: 12px; }
-    .shiny-image-output img { object-fit: contain; }
-    .shoe-caption { color: #576574; font-size: 0.93rem; }
-  "))),
-  
-  nav_panel(
-    "Shoe Search",
-    scroll_tab(
-      layout_sidebar(
-        fill = FALSE, fillable = FALSE,
-        sidebar = sidebar(
-          title = "Search Controls", width = 310,
-          radioButtons("src", "Photo Source",
-                       choices = c("Catalogue", "Self-check", "Upload"),
-                       selected = "Catalogue", inline = TRUE),
-          conditionalPanel(
-            "input.src == 'Catalogue'",
-            numericInput("cat_id", "Catalogue ID",
-                         value = shoes_meta$id[1],
-                         min = min(shoes_meta$id), max = max(shoes_meta$id))
-          ),
-          conditionalPanel(
-            "input.src == 'Self-check'",
-            selectInput("sc_file", "Self-check Photo", choices = selfcheck_files),
-            p(class = "shoe-caption", "If labels.csv is available, the true category is displayed.")
-          ),
-          conditionalPanel(
-            "input.src == 'Upload'",
-            fileInput("photo", "Upload Photo (JPG/PNG)",
-                      accept = c(".jpg", ".jpeg", ".png"))
-          ),
-          hr(),
-          sliderInput("K", "Number of Principal Components (K)",
-                      min = 1, max = K_MAX, value = min(20L, K_MAX), step = 1),
-          sliderInput("image_size", "Image Size", min = 96, max = 240,
-                      value = 160, step = 8, post = " px"),
-          uiOutput("image_size_css")
-        ),
-        card(
-          fill = FALSE,
-          card_header("Search Results and Prediction"),
-          card_body(
-            fill = FALSE, fillable = FALSE,
-            uiOutput("prediction"),
-            hr(),
-            layout_columns(
-              col_widths = c(5, 7), fill = FALSE, fillable = FALSE,
-              shoe_image_card("Best Match", "best_match"),
-              card(fill = FALSE, card_header("Top 5 Similar Shoes"),
-                   tableOutput("top5"))
-            ),
-            hr(),
-            h4("PCA Image Comparison"),
-            layout_columns(
-              col_widths = c(4, 4, 4), fill = FALSE, fillable = FALSE,
-              shoe_image_card("Selected Shoe", "original_shoe"),
-              shoe_image_card("Average Shoe", "average_shoe"),
-              shoe_image_card("PCA Reconstruction", "reconstructed_shoe")
-            ),
-            h4("Top 5 Nearest Neighbors"),
-            plotOutput("search_top5_gallery", height = "230px")
-          )
-        )
-      )
-      
-    )
-  ),
-  
-  nav_panel(
-    "Explain PCA",
-    scroll_tab(
-      p("Explore how the photo selected on the Shoe Search tab is represented and matched."),
-      layout_columns(
-        col_widths = c(6, 6), fill = FALSE, fillable = FALSE,
-        card(card_header("Step 1 | Average shoe"),
-             p("The mean image of all catalogue photos (x-bar)."),
-             plotOutput("pca_step1", height = "250px")),
-        card(card_header("Step 2 | Photo minus average"),
-             p("Blue means below the average pixel value; red means above it."),
-             plotOutput("pca_step2", height = "250px"))
-      ),
-      card(card_header("Step 3 | PCA score map (PC1 and PC2)"),
-           p("Catalogue points are colored by category; your selected photo is highlighted."),
-           plotOutput("pca_step3", height = "410px")),
-      card(card_header("Step 4 | First 10 eigenshoes"),
-           p("Principal component loadings, with their individual explained variance."),
-           plotOutput("pca_step4", height = "440px")),
-      card(card_header("Step 5 | Query scores"),
-           p("The first K PCA coordinates used to calculate nearest-neighbor distances."),
-           tableOutput("pca_step5_table")),
-      card(card_header("Step 6 | Reconstruct using different K values"),
-           p("Compare the same photo reconstructed using different numbers of components."),
-           plotOutput("pca_step6", height = "300px")),
-      card(card_header("Classification accuracy versus K"),
-           p("Leave-one-out evaluation of the catalogue: each photo is classified using the five nearest other photos. Computing all K values can be slow."),
-           actionButton("run_acc", "Compute leave-one-out accuracy", class = "btn-primary"),
-           plotOutput("acc_plot", height = "400px"),
-           textOutput("acc_text"),
-           p(class = "shoe-caption",
-             "Choosing K based on this same catalogue gives an optimistic estimate of performance on new photos. Test personal shoes separately."))
-      
-    )
-  ),
-  
-  nav_panel(
-    "Our Shoes",
-    scroll_tab(
-      p("Test images the PCA model has not seen. Use filenames such as Alex_Sandals_1.jpg (Name_Category_Number)."),
-      p("Uploaded images are temporary. To keep photos across restarts, save them in the ourshoes folder."),
-      fileInput("our_upload", "Add Our Photos", multiple = TRUE,
-                accept = c(".jpg", ".jpeg", ".png")),
-      actionButton("our_reset", "Remove Uploaded Photos"),
-      uiOutput("our_upload_msg"),
-      uiOutput("our_empty_msg"),
-      card(
-        card_header("Analyze a Selected Shoe"),
-        selectInput("our_pick", "Choose a Shoe", choices = character(0), width = "100%"),
-        uiOutput("our_prediction"),
-        plotOutput("our_best_plot", height = "300px"),
-        h5("Five Closest Catalogue Photos"),
-        tableOutput("our_top5_table"),
-        plotOutput("our_top5_plot", height = "220px")
-      ),
-      card(card_header("All Our Photos"), plotOutput("our_grid", height = "auto")),
-      card(card_header("Overall Results at the Selected K"),
-           textOutput("our_summary"), tableOutput("our_all_table"))
-      
-    )
-  ),
-  
-  nav_panel(
-    "Data 1",
-    scroll_tab(
-      p("Descriptive exploration of a Project 1 CSV dataset. Upload the original data; no results are invented."),
-      fileInput("data1_file", "Upload Project 1 CSV", accept = ".csv"),
-      layout_columns(
-        col_widths = c(4, 4, 4), fill = FALSE, fillable = FALSE,
-        selectInput("data1_group", "Group By", choices = c("No grouping" = "")),
-        selectInput("data1_filter", "Filter Column", choices = c("No filter" = "")),
-        selectInput("data1_value", "Filter Value", choices = c("All values" = ""))
-      ),
-      selectInput("data1_measure", "Numeric Measure", choices = character(0)),
-      h4("Descriptive Results"),
-      tableOutput("data1_summary"),
-      textOutput("data1_description"),
-      h4("Data Preview"),
-      tableOutput("data1_preview"),
-      p(class = "shoe-caption",
-        "Complete the Project 1 research question, interpretation, and next-analysis plan using your actual dataset.")
-      
-    )
-  ),
-  
-  nav_panel(
-    "AI",
-    scroll_tab(
-      card(
-        card_header("Ethics Statement"),
-        p("We understand the rules on data and AI use for this project, including following the license and privacy rules of every dataset we used, understanding all of our code, and knowing that presenting AI output as our own work may be academic misconduct. We certify that we have followed all of them. Any violation is our responsibility, and we agree to receive an F in this course if we have not."),
-        p(strong("Signed: TODO - all team members must review and sign."))
-      ),
-      card(
-        card_header("What AI Did and What the Team Did"),
-        p("Draft development notes. Verify and edit these statements before submitting."),
-        tableOutput("ai_table")
-      ),
-      card(
-        card_header("Individual Reflections"),
-        p("Each member must write or confirm their own reflection."),
-        tableOutput("ai_reflection")
-      )
-      
-    )
-  )
+ui <- navbarPage("Team_chipmunk",
+                 tabPanel("Shoe Search",
+                          radioButtons("src", "Photo", c("Catalogue", "Self-check", "Upload"), inline = TRUE),
+                          numericInput("cat_id", "Catalogue id", 1, 1, 2000),
+                          selectInput("sc_file", "Self-check photo", sprintf("selfcheck_%02d.png", 1:4)),
+                          fileInput("photo", "Upload", accept = c(".jpg", ".jpeg", ".png")),
+                          sliderInput("K", "Number of PCs (K)", 1, 100, 20),
+                          hr(),
+                          h3("Prediction Result"),
+                          textOutput("pred_text"),       # 예측 결과 및 정답 여부
+                          h4("Top 5 Closest Shoes"),
+                          tableOutput("top5_table"),     # Top 5 목록 (ID, 카테고리, 거리)
+                          h4("Best Match Details"),
+                          plotOutput("best_match_plot")   #[완료] TODO: best match, top 5, prediction, right or wrong
+                 ),
+                 tabPanel("Explain PCA",
+                          p("For the photo chosen in Shoe Search, show how PCA finds the match."),
+                          
+                          h4("Step 1. Average shoe"), 
+                          p("x̅, the mean of the 2,000 photos."),
+                          plotOutput("pca_step1"),
+                          
+                          h4("Step 2. Photo − average"), 
+                          p("x − x̅, where the photo is brighter or darker than the average shoe."),
+                          plotOutput("pca_step2"),
+                          
+                          h4("Step 3. Score map"), 
+                          p("All catalogue photos on PC1 and PC2, colored by category, with your photo marked."),
+                          plotOutput("pca_step3"),
+                          
+                          h4("Step 4. Eigenshoes"), 
+                          p("Show PC1, PC2, … as pictures (their loadings drawn as 64 × 64 images), so we can see what shape each PC captures, and how much variance each explains."),
+                          plotOutput("pca_step4", height = "420px"),   # [수정 3] 격자(2x5)가 보이도록 높이 키움
+                          
+                          h4("Step 5. Scores"), 
+                          p("The photo’s first K PC scores, the numbers used to find the match."),
+                          tableOutput("pca_step5_table"),
+                          
+                          h4("Step 6. Rebuild"), 
+                          p("The photo rebuilt from the average shoe and the first K eigenshoes, for several K."),
+                          plotOutput("pca_step6"),
+                          
+                          h4("More"), 
+                          p("Anything else you want to show or explain related to it."),
+                          
+                          # [수정 9] K별 예측 정확도
+                          h5("Prediction accuracy for each K"),
+                          p("How well does the app predict the shoe type for different numbers of PCs (K)? We test it on the 2,000 catalogue photos,",
+                            "because only they have a known true category. Each photo is searched against the other 1,999 photos",
+                            "(itself left out), the most common category among its top 5 is the prediction, and we compare it with the true category.",
+                            "This is called leave-one-out testing."),
+                          actionButton("run_acc", "Compute accuracy for K = 1 to 100 (about 10-30 seconds, only needed once)"),
+                          plotOutput("acc_plot", height = "420px"),
+                          textOutput("acc_text")
+                 ),
+                 tabPanel("Our Shoes",
+                          p("Can your app recognize real shoes it has never seen?"),
+                          p("Each member photographed 3 different shoes of their own (shoe only, plain background). The app has never seen these photos."),
+                          p("Choose a shoe below to see its best match, its top 5 and whether the prediction is right. The number of PCs (K) is the one set in the Shoe Search tab."),
+                          uiOutput("our_shoes_ui")     # [수정 11] 사진 목록, 선택 위젯, 결과가 여기에 표시됨
+                 ),
+                 tabPanel("Data 1",
+                          sidebarLayout(
+                            sidebarPanel(
+                              width = 3,
+                              tags$style(HTML("#d1_nav { flex-direction: column; }")),   # 왼쪽 메뉴를 세로로
+                              
+                              # ---- 왼쪽 위: Finding 탭 (내용은 오른쪽, 이 탭은 이름만 가진 메뉴) ----
+                              tabsetPanel(
+                                id = "d1_nav",
+                                type = "pills",
+                                tabPanel("Finding A"),
+                                tabPanel("Finding B")
+                              ),
+                              hr(),
+                              
+                              # ---- 왼쪽 아래: 선택한 탭의 조정 위젯 ----
+                              conditionalPanel(
+                                condition = "input.d1_nav == 'Finding A'",
+                                sliderInput(
+                                  "year_range",
+                                  "Select year range",
+                                  min = min(lyrics$year),
+                                  max = max(lyrics$year),
+                                  value = c(min(lyrics$year), max(lyrics$year)),
+                                  step = 1,
+                                  sep = ""
+                                ),
+                                checkboxGroupInput(
+                                  "a_rules",
+                                  "Counting rule (choose one or more)",
+                                  choices = RULE_CHOICES,
+                                  selected = "main"
+                                ),
+                                checkboxInput("a_hive", "Compare HYBE vs Non-HYBE", value = FALSE),
+                                checkboxInput("a_show_b", "Show the HYBE vs Non-HYBE comparison (at the bottom)", value = FALSE),
+                                helpText("Two or more rules draw one line per rule. HYBE has only a few songs in some years, so read its line with care.")
+                              ),
+                              conditionalPanel(
+                                condition = "input.d1_nav == 'Finding B'",
+                                sliderInput(
+                                  "c_thr",
+                                  "English-centered = at least this share of English words",
+                                  min = 10, max = 90, value = 50, step = 5, post = "%"
+                                ),
+                                checkboxInput("c_hive", "Compare HYBE vs Non-HYBE", value = FALSE),
+                                helpText("Counting rule: main (all English words). The boxes cover all years, 2014-2025.")
+                              )
+                            ),
+                            
+                            mainPanel(
+                              width = 9,
+                              
+                              # ================= Finding A =================
+                              conditionalPanel(
+                                condition = "input.d1_nav == 'Finding A'",
+                                
+                                h3("Has English Usage in K-pop Lyrics Increased Over Time?"),
+                                
+                                p("Explore how the proportion of English words in K-pop lyrics has changed from 2014 to 2025."),
+                                
+                                # Plain-language explanation of the three counting rules (click the title to fold it)
+                                tags$details(
+                                  open = "open",
+                                  style = "margin-bottom: 20px;",
+                                  tags$summary(tags$b("How do the counting rules work?")),
+                                  p(style = "margin-top: 10px;",
+                                    "For every song we count the Korean words (K) and the English words (E). The English share of a song is E divided by (K + E), times 100. The three rules differ only in which words are counted."),
+                                  fluidRow(
+                                    column(4, wellPanel(
+                                      h4("main"),
+                                      p(strong("Every word counts.")),
+                                      p("Fillers such as 'oh' and 'yeah' are counted, and so is every repeat."),
+                                      p(em("Use: the basic measure."))
+                                    )),
+                                    column(4, wellPanel(
+                                      h4("sub_1"),
+                                      p(strong("English fillers are left out.")),
+                                      p("Ad-libs such as oh, yeah, la and lalala are not counted."),
+                                      p(em("Answers: 'Do ad-libs make English look bigger than it is?'"))
+                                    )),
+                                    column(4, wellPanel(
+                                      h4("sub_2"),
+                                      p(strong("A repeated word counts once per song.")),
+                                      p("Inside one song, a word that appears many times is counted a single time."),
+                                      p(em("Answers: 'Is it just the chorus repeating the same English words?'"))
+                                    ))
+                                  ),
+                                  h5("Example (an invented line, only to show how the counting works)"),
+                                  p(tags$code("baby baby baby 사랑해 yeah yeah 사랑해")),
+                                  tags$table(
+                                    class = "table table-sm",
+                                    tags$thead(tags$tr(tags$th("Rule"), tags$th("English words (E)"), tags$th("Korean words (K)"), tags$th("English share"))),
+                                    tags$tbody(
+                                      tags$tr(tags$td("main"),  tags$td("5  (baby x3, yeah x2)"), tags$td("2  (사랑해 x2)"), tags$td("5 / 7 = 71.4%")),
+                                      tags$tr(tags$td("sub_1"), tags$td("3  (baby x3; yeah is a filler)"), tags$td("2  (사랑해 x2)"), tags$td("3 / 5 = 60.0%")),
+                                      tags$tr(tags$td("sub_2"), tags$td("2  (baby, yeah; each once)"), tags$td("1  (사랑해, once)"), tags$td("2 / 3 = 66.7%"))
+                                    )
+                                  ),
+                                  helpText("sub_1 and sub_2 count fewer words than main, so their English share is usually lower. What we compare is how it changes over the years.")
+                                ),
+                                
+                                # Summary statistics (one row of boxes per selected line)
+                                uiOutput("a_stats"),
+                                
+                                # Graph
+                                h4("Key Finding"),
+                                
+                                h3("English Lyrics Do Not Determine Song Popularity in the Korean Market"),
+                                
+                                p("Our results suggest that the proportion of English lyrics alone cannot explain a song's popularity on the Melon chart. Since Melon is a Korean music streaming platform primarily used by Korean listeners, our findings mainly reflect music popularity and listening preferences in the Korean market."),
+                                
+                                p("Therefore, these results should not be directly generalized to international K-pop audiences."),
+                                
+                                hr(),
+                                
+                                h4("Finding A: English Lyrics Usage by Year"),
+                                
+                                plotOutput("year_plot", height = "400px"),
+                                
+                                # Interpretation
+                                h4("Why Does It Matter?"),
+                                p("This analysis helps us understand how the use of English in K-pop lyrics has changed over time."),
+                                
+                                h4("Next Analysis"),
+                                p("We can further investigate whether English usage differs between different groups of artists."),
+                                
+                                # ---- HYBE vs Non-HYBE comparison (the old Finding B tab): shown only when its box is ticked ----
+                                conditionalPanel(
+                                  condition = "input.a_show_b",
+                                  hr(),
+                                  
+                                  
+                                  h3("Does English Usage Differ Between HYBE and Non-HYBE Artists?"),
+                                  
+                                  # Why did we choose HYBE?
+                                  h4("Why Did We Choose HYBE?"),
+                                  
+                                  p("HYBE is one of the major entertainment companies in the K-pop industry, with artists who have gained significant international recognition."),
+                                  
+                                  p("As K-pop continues to expand globally, we became curious about whether English usage in song lyrics differs between artists affiliated with HYBE and those from other entertainment companies."),
+                                  
+                                  wellPanel(
+                                    h4("Our Research Question"),
+                                    p("Does English usage differ between HYBE and Non-HYBE artists?")
+                                  ),
+                                  
+                                  p("To answer this question, we divided the songs into two groups: HYBE and Non-HYBE, and compared the proportion of English words in their lyrics."),
+                                  
+                                  # Input: Select artist group
+                                  h4("Explore the Data"),
+                                  
+                                  selectInput(
+                                    "hive_group",
+                                    "Select Group",
+                                    choices = c(
+                                      "All Groups" = "all",
+                                      "HYBE" = "true",
+                                      "Non-HYBE" = "false"
+                                    ),
+                                    selected = "all"
+                                  ),
+                                  
+                                  # Summary statistics
+                                  fluidRow(
+                                    column(
+                                      4,
+                                      wellPanel(
+                                        h4("Number of Songs"),
+                                        h3(textOutput("hive_count"))
+                                      )
+                                    ),
+                                    column(
+                                      4,
+                                      wellPanel(
+                                        h4("Mean English Percentage"),
+                                        h3(textOutput("hive_mean"))
+                                      )
+                                    ),
+                                    column(
+                                      4,
+                                      wellPanel(
+                                        h4("Median English Percentage"),
+                                        h3(textOutput("hive_median"))
+                                      )
+                                    )
+                                  ),
+                                  
+                                  # Graph
+                                  h4("English Usage by Group"),
+                                  plotOutput("hive_plot", height = "400px"),
+                                  
+                                  # Interpretation
+                                  h4("Why Does It Matter?"),
+                                  
+                                  p("This comparison helps us explore whether English usage is associated with an artist's entertainment company affiliation. It may also provide insights into different approaches to the global K-pop market."),
+                                  
+                                  # Next Analysis
+                                  h4("Next Analysis"),
+                                  
+                                  p("We can further investigate whether English usage is related to chart rankings and whether these patterns are consistent across different years.")
+                                )
+                              ),
+                              
+                              # ================= Finding B =================
+                              conditionalPanel(
+                                condition = "input.d1_nav == 'Finding B'",
+                                
+                                h3("How Many Songs Are English-Centered?"),
+                                
+                                p("Explore the share of songs whose lyrics are mostly English, year by year. You decide how much English a song needs to count as English-centered."),
+                                
+                                # Summary statistics (one row of boxes per selected group)
+                                uiOutput("c_stats"),
+                                
+                                h4("Share of English-Centered Songs by Year"),
+                                plotOutput("c_plot", height = "400px"),
+                                
+                                h4("Why Does It Matter?"),
+                                
+                                p("A rising average could mean that every song uses a little more English, or that more songs are written mostly in English. Counting the songs above a cut-off separates the two. With the default 50% cut-off, English-centered songs grew from about 4% of the chart in 2014 to about 41% in 2025."),
+                                
+                                p("The cut-off changes the story. With a stricter 70% cut-off, English-centered songs stay at or below 4% through 2022 and reach about 28% in 2025, so the growth is recent."),
+                                
+                                h4("Next Analysis"),
+                                
+                                p("We can look at which artists and songs are behind the increase, and compare it with our other datasets over 2022-2025, the years when the change is steepest.")
+                              )
+                            )
+                          )
+                 ),
+                 tabPanel("AI",
+                          h3("Ethics Statement"),
+                          tags$blockquote("“We understand the rules on data and AI use for this project, including following the license and privacy rules of every dataset we used, understanding all of our code, and knowing that presenting AI output as our own work may be academic misconduct. We certify that we have followed all of them. Any violation is our responsibility, and we agree to receive an F in this course if we have not.”"),
+                          
+                          hr(),
+                          h3("What AI did and what you did"),
+                          p("A short summary for each tab of the project."),
+                          tableOutput("ai_summary_table"),
+                          
+                          hr(),
+                          h3("Individual Reflections"),
+                          p("Each member's reflection on AI assistance, failures, and learnings (including the required keyword)."),
+                          tableOutput("ai_reflection_table")
+                 ),
+                 
+                 theme = bs_theme(
+                   version = 5,
+                   bootswatch = "minty",
+                   primary = "#8064D8",
+                   secondary = "#B9A5F5",
+                   bg = "#F8F7FC",
+                   fg = "#29243A"
+                 ),
+                 
+                 header = tags$head(
+                   tags$style(HTML("
+      body {
+        background-color: #F8F7FC;
+        font-family: 'Arial', sans-serif;
+      }
+
+      .navbar {
+        background-color: #FFFFFF !important;
+        border-bottom: 1px solid #EAE5F5;
+        padding: 12px;
+      }
+
+      .navbar-brand {
+        color: #7153C6 !important;
+        font-weight: bold;
+        font-size: 22px;
+      }
+
+      .navbar-nav .nav-link {
+        color: #625B70 !important;
+        font-weight: 600;
+        border-radius: 10px;
+        margin: 3px;
+      }
+
+      .navbar-nav .nav-link.active {
+        background-color: #8064D8 !important;
+        color: white !important;
+      }
+
+      h3 {
+        color: #6047A8;
+        font-weight: bold;
+        margin-top: 20px;
+      }
+
+      h4 {
+        color: #51466D;
+        font-weight: bold;
+      }
+
+      .well {
+        background-color: white;
+        border: 1px solid #EAE5F5;
+        border-radius: 15px;
+        box-shadow: 0 3px 12px rgba(80, 60, 130, 0.06);
+        padding: 20px;
+      }
+
+      .btn {
+        background-color: #8064D8;
+        border-color: #8064D8;
+        border-radius: 10px;
+      }
+
+      .form-control {
+        border-radius: 10px;
+        border-color: #DDD5EF;
+      }
+    "))
+                 )
 )
 
-# 8. REACTIVE SERVER -----------------------------------------
 server <- function(input, output, session) {
-  
-  # Search controls: resize output images without changing the 64 x 64 PCA data.
-  output$image_size_css <- renderUI({
-    size <- input$image_size
-    best_size <- round(size * 4 / 3)
-    tags$style(HTML(sprintf(" 
-      #best_match { width: min(100%%, %dpx) !important; }
-      #original_shoe, #average_shoe, #reconstructed_shoe {
-        width: min(100%%, %dpx) !important;
-      }
-      #best_match, #original_shoe, #average_shoe, #reconstructed_shoe {
-        height: auto !important; aspect-ratio: 1 / 1;
-      }
-      #best_match img, #original_shoe img, #average_shoe img,
-      #reconstructed_shoe img { width: 100%% !important; height: 100%% !important; }
-    ", best_size, size)))
-  })
-  
-  # One query representation is shared by both the Search and Explain PCA tabs.
-  query_data <- reactive({
-    req(input$src)
+  #tab1
+  # 1. 사용자가 선택한 사진의 픽셀 벡터를 가져오는 반응형 함수 (Reactive)
+  selected_shoe_vec <- reactive({
+    src_type <- input$src
     
-    if (identical(input$src, "Catalogue")) {
-      req(input$cat_id)
-      index <- match(as.integer(input$cat_id), shoes_meta$id)
-      validate(need(!is.na(index), "Catalogue ID not found."))
-      return(list(
-        vector = as.numeric(pca_data$X[index, ]),
-        actual = shoes_meta$category[index],
-        exclude_id = shoes_meta$id[index]
-      ))
-    }
-    
-    if (identical(input$src, "Self-check")) {
-      req(input$sc_file)
-      path <- file.path("selfcheck", basename(input$sc_file))
-      validate(need(file.exists(path), "Self-check photo not found."))
-      vector <- tryCatch(read_external_vector(path), error = function(e) NULL)
-      validate(need(!is.null(vector), "Could not read the self-check photo."))
-      return(list(
-        vector = vector,
-        actual = read_selfcheck_label(input$sc_file),
-        exclude_id = NULL
-      ))
-    }
-    
-    req(input$photo)
-    vector <- tryCatch(
-      read_external_vector(input$photo$datapath), error = function(e) NULL
-    )
-    validate(need(!is.null(vector), "Could not read the uploaded image."))
-    list(vector = vector, actual = NA_character_, exclude_id = NULL)
-  })
-  
-  shoe_search <- reactive({
-    query <- query_data()
-    find_similar_shoes(query$vector, input$K, query$exclude_id)
-  })
-  
-  output$prediction <- renderUI({
-    result <- shoe_search()
-    actual <- query_data()$actual
-    known <- !is.na(actual) && nzchar(actual)
-    verdict <- if (!known) "Unknown (no ground-truth category)" else if (
-      tolower(result$prediction) == tolower(actual)
-    ) "Correct" else "Incorrect"
-    
-    tagList(
-      p(strong("Predicted Category: "), result$prediction),
-      p(strong("Actual Category: "), if (known) actual else "Not available"),
-      p(strong("Result: "), verdict)
-    )
-  })
-  
-  output$top5 <- renderTable(shoe_search()$top5,
-                             striped = TRUE, bordered = TRUE, spacing = "s")
-  
-  output$best_match <- renderImage({
-    id <- shoe_search()$best_id
-    list(src = file.path("shoes", sprintf("%04d.png", id)),
-         contentType = "image/png", alt = paste("Catalogue shoe", id))
-  }, deleteFile = FALSE)
-  
-  output$original_shoe <- renderImage({
-    list(src = save_vector_png(query_data()$vector),
-         contentType = "image/png", alt = "Selected shoe")
-  }, deleteFile = TRUE)
-  
-  output$average_shoe <- renderImage({
-    list(src = save_vector_png(pca_data$x_bar),
-         contentType = "image/png", alt = "Average shoe")
-  }, deleteFile = TRUE)
-  
-  output$reconstructed_shoe <- renderImage({
-    list(src = save_vector_png(reconstruct_shoe(query_data()$vector, input$K)),
-         contentType = "image/png",
-         alt = paste("PCA reconstruction using", input$K, "components"))
-  }, deleteFile = TRUE)
-  
-  output$search_top5_gallery <- renderPlot({
-    result <- shoe_search()$top5
-    old <- par(mfrow = c(1, NEIGHBORS), mar = c(1, 1, 3, 1))
-    on.exit(par(old))
-    for (j in seq_len(NEIGHBORS)) {
-      row <- match(result$ID[j], shoes_meta$id)
-      plot_shoe(pca_data$X[row, ],
-                paste0("#", j, " ID ", result$ID[j], "\n", result$Category[j]))
+    if (src_type == "Catalogue") {
+      # 카탈로그에서 고른 경우: 해당 ID의 행 데이터 가져오기 (1부터 시작하므로 그대로 인덱스 사용)
+      idx <- input$cat_id
+      return(shoe_matrix[idx, ])
+      
+    } else if (src_type == "Self-check") {
+      # 셀프체크 사진인 경우
+      return(load_any(file.path("selfcheck", input$sc_file)))   # [수정 1] 공통 변환 함수 사용
+      
+    } else {
+      # 파일을 직접 업로드한 경우
+      req(input$photo) # 업로드 파일이 있을 때만 실행
+      # [수정 1] 정사각형으로 맞추고(흰색으로 채움) 64x64 흑백으로 변환하는 공통 함수 사용
+      return(load_any(input$photo$datapath))
     }
   })
   
-  # EXPLAIN PCA ----------------------------------------------
-  output$pca_step1 <- renderPlot({
-    plot_shoe(pca_data$x_bar, "Average shoe")
-  })
-  
-  output$pca_step2 <- renderPlot({
-    difference <- query_data()$vector - pca_data$x_bar
-    plot_shoe(difference, "Selected photo - average", signed = TRUE)
-  })
-  
-  output$pca_step3 <- renderPlot({
-    query <- query_data()$vector
-    two_PC <- pca_data$loadings[, 1:2, drop = FALSE]
-    position <- as.numeric((query - pca_data$x_bar) %*% two_PC)
-    coordinates <- pca_data$scores[, 1:2, drop = FALSE]
+  # 2. PCA를 이용해 가장 가까운 Top 5 찾기 및 거리 계산
+  search_results <- reactive({
+    query_vec <- selected_shoe_vec()
+    K <- input$K
     
-    plot(
-      coordinates[, 1], coordinates[, 2],
-      col = grDevices::adjustcolor(
-        category_colors[shoes_meta$category], alpha.f = 0.5
-      ),
-      pch = 16, cex = 0.8,
-      xlim = range(c(coordinates[, 1], position[1])),
-      ylim = range(c(coordinates[, 2], position[2])),
-      xlab = "PC1 Score", ylab = "PC2 Score", main = "PCA Score Map"
+    # 쿼리 이미지의 평균 중심 맞추기
+    query_centered <- query_vec - x_bar
+    
+    # 선택된 K개의 주성분(Eigenshoes)만 사용하여 쿼리의 PC 스코어 계산
+    query_scores <- query_centered %*% pca_result$rotation[, 1:K]
+    
+    # 카탈로그 전체의 PC 스코어 (이미 계산된 pca_result$x 활용)
+    catalog_scores <- pca_result$x[, 1:K]
+    
+    # 유클리드 거리(Euclidean Distance) 계산
+    distances <- sqrt(rowSums((catalog_scores - matrix(query_scores, nrow = 2000, ncol = K, byrow = TRUE))^2))
+    
+    # 만약 카탈로그 ID로 검색한 경우, 자기 자신과의 거리를 무한대로 만들어 검색 결과에서 제외
+    if (input$src == "Catalogue") {
+      distances[input$cat_id] <- Inf
+    }
+    
+    # 거리가 가장 가까운 상위 5개 인덱스 추출
+    top5_idx <- order(distances)[1:5]
+    
+    # 결과 데이터프레임 만들기
+    res_df <- data.frame(
+      Rank = 1:5,
+      ID = top5_idx,
+      Category = meta$category[top5_idx],
+      Distance = round(distances[top5_idx], 2)
     )
-    points(position[1], position[2], pch = 23, bg = "black",
-           col = "#FFD43B", cex = 2.5, lwd = 2)
-    legend(
-      "topright", legend = c(category_levels, "Selected photo"),
-      col = c(unname(category_colors), "#FFD43B"),
-      pt.bg = c(rep(NA_character_, length(category_levels)), "black"),
-      pch = c(rep(16, length(category_levels)), 23),
-      cex = 0.8, bg = "white"
-    )
+    
+    return(res_df)
   })
   
-  output$pca_step4 <- renderPlot({
-    n_show <- min(10L, K_MAX)
-    old <- par(mfrow = c(2, 5), mar = c(1, 1, 3, 1))
-    on.exit(par(old))
-    for (k in seq_len(n_show)) {
-      plot_shoe(
-        pca_data$loadings[, k],
-        sprintf("PC %d (%.1f%%)", k, pca_data$var_explained[k]),
-        signed = TRUE
-      )
+  # 3. 화면 출력 1: Top 5 표 (Table)
+  output$top5_table <- renderTable({
+    search_results()
+  })
+  
+  # 4. 화면 출력 2: 예측 결과 (Text)
+  output$pred_text <- renderText({
+    top5 <- search_results()
+    # Top 5 중 가장 많이 나온 카테고리를 예측값으로 선정
+    # [수정 5] 동점이면 가장 가까운 사진의 카테고리를 선택
+    pred_cat <- predict_cat(top5)
+    
+    # 만약 카탈로그 검색이라면 실제 정답 카테고리와 비교
+    if (input$src == "Catalogue") {
+      true_cat <- meta$category[input$cat_id]
+      is_correct <- ifelse(pred_cat == true_cat, "Right", "Wrong")
+      paste0("Predicted category: ", pred_cat, " | Actual category: ", true_cat, " -> ", is_correct)
+    } else {
+      paste0("Predicted category: ", pred_cat)
     }
   })
   
-  output$pca_step5_table <- renderTable({
-    score_vector <- shoe_search()$query_scores
+  # 5. 화면 출력 3: 베스트 매치 시각화 (Plot - 원본, 평균, 복원 이미지 비교)
+  output$best_match_plot <- renderPlot({
+    top5 <- search_results()
+    best_id <- top5$ID[1] # 가장 가까운 1등 신발 ID
+    K <- input$K
+    
+    # 1등 신발의 원본 벡터를 64x64 이미지로 변환
+    best_mat <- matrix(shoe_matrix[best_id, ], 64, 64, byrow = TRUE)
+    
+    # K개의 PC로 복원된 이미지 계산
+    mean_mat <- matrix(x_bar, 64, 64, byrow = TRUE)
+    query_centered <- selected_shoe_vec() - x_bar
+    scores <- query_centered %*% pca_result$rotation[, 1:K]
+    rebuilt_vec <- x_bar + scores %*% t(pca_result$rotation[, 1:K])
+    rebuilt_mat <- matrix(rebuilt_vec, 64, 64, byrow = TRUE)
+    
+    # 화면에 3개의 이미지를 나란히 그리기 (원본, 평균, 복원)
+    par(mfrow = c(1, 3), mar = c(2, 2, 2, 2))
+    image(t(apply(best_mat, 2, rev)), col = gray(0:100/100), axes = FALSE, asp = 1, main = paste0("Best Match (ID: ", best_id, ")"))
+    image(t(apply(mean_mat, 2, rev)), col = gray(0:100/100), axes = FALSE, asp = 1, main = "Average Shoe")
+    image(t(apply(rebuilt_mat, 2, rev)), col = gray(0:100/100), axes = FALSE, asp = 1, main = paste0("Rebuilt (K=", K, ")"))
+  })
+  
+  # AI 탭 테이블 (TODO 제거 및 예시 채우기)
+  output$ai_table <- renderTable(data.frame(
+    Tab = c("Shoe Search", "Explain PCA", "Our Shoes", "Data 1"),
+    #수정하기!! TODO
+    `What AI did` = c("Implemented the distance calculation and PCA matching algorithm", "Helped with the step-by-step PCA visualizations", "Connected our own shoe data", "Wrote data analysis queries"),
+    `What we did` = c("UI design and final verification", "Layout arrangement", "Photographed and uploaded our own shoes", "Drew business insights"),
+    check.names = FALSE))
+  
+  # --- Part 3: AI 탭 출력 로직 ---
+  
+  # 1. 탭별 AI vs 인간 역할 분담 요약 표
+  output$ai_summary_table <- renderTable({
     data.frame(
-      PC = paste0("PC", seq_along(score_vector)),
-      Score = round(score_vector, 2)
+      Tab = c("Shoe Search", "Explain PCA", "Our Shoes", "Finding A", "Finding B"),
+      `What AI did` = c(
+        "Wrote the skeleton code for the distance calculation and PCA matching algorithm",
+        "Helped with the code for the 6-step PCA visualization (average, deviation, score map, eigenshoes, etc.)",
+        "Designed the upload and preprocessing logic for personal shoe images",
+        "TODO: write what AI really did for Finding A",
+        "TODO: write what AI really did for Finding B"
+      ),
+      `What we did` = c(
+        "UI layout design and final result verification",
+        "Refined graph layouts and text explanations",
+        "Photographed our own shoes and managed the directory structure",
+        "TODO: write what we did for Finding A",
+        "TODO: write what we did for Finding B"
+      ),
+      check.names = FALSE
     )
-  }, striped = TRUE, spacing = "s")
+  }, striped = TRUE, hover = TRUE)
   
-  output$pca_step6 <- renderPlot({
-    ks <- sort(unique(c(1L, 5L, 20L, min(50L, K_MAX), input$K)))
-    ks <- ks[ks <= K_MAX]
-    old <- par(mfrow = c(1, length(ks)), mar = c(1, 1, 3, 1))
-    on.exit(par(old))
-    for (k in ks) {
-      plot_shoe(reconstruct_shoe(query_data()$vector, k),
-                paste0("K = ", k, if (k == input$K) "\n(selected)" else ""))
+  # 2. 팀원별 소감 표 
+  output$ai_reflection_table <- renderTable({
+    data.frame(
+      Member = c("박선우", "송현정", "한우영", "신유진", "Flo"),
+      #수정하기 TODO, 각자 역할 쓰기
+      Reflection = c(
+        "AI was a great help in writing the skeleton code for complex matrix operations and distance calculations. However, I studied the formulas and code line by line to understand the concept of dimensionality reduction properly.",
+        "AI provided an excellent layout structure while we visualized the 6 steps of PCA. I edited details such as grayscale image handling myself and made the code my own.",
+        "AI was useful for debugging errors that came up during data preprocessing and text handling. It shortened overall development time, so I could focus more on interpreting and verifying the data.",
+        "I worked out how to connect the UI with the reactive server logic together with AI. It was a reliable helper for turning a complex algorithm into code.",
+        "Together with my teammates, I reviewed and verified the code AI suggested. I built my development skills by fixing the exception handling and detailed settings that AI missed."
+      ),
+      check.names = FALSE
+    )
+  }, striped = TRUE, hover = TRUE)
+  
+  # --- Tab 2: Explain PCA 시각화 출력들 ---
+  
+  # Step 1. 평균 신발 이미지
+  output$pca_step1 <- renderPlot({
+    mean_mat <- matrix(x_bar, 64, 64, byrow = TRUE)
+    image(t(apply(mean_mat, 2, rev)), col = gray(0:100/100), axes = FALSE, asp = 1, main = "Average Shoe (x̄)")
+  })
+  
+  # Step 2. 사진 - 평균 (편차 이미지)
+  output$pca_step2 <- renderPlot({
+    query_vec <- selected_shoe_vec()
+    diff_vec <- query_vec - x_bar
+    diff_mat <- matrix(diff_vec, 64, 64, byrow = TRUE)
+    # 편차는 음수/양수가 있으므로 색상 팔레트 조정 가능 (여기선 흑백으로 표현)
+    image(t(apply(diff_mat, 2, rev)), col = gray(0:100/100), axes = FALSE, asp = 1, main = "Photo − Average (x - x̄)")
+  })
+  
+  # Step 3. Score map (PC1 vs PC2 산점도 및 현재 사진 마킹)
+  output$pca_step3 <- renderPlot({
+    # 카탈로그 전체의 PC1, PC2 스코어 가져오기
+    pc1 <- pca_result$x[, 1]
+    pc2 <- pca_result$x[, 2]
+    
+    # 현재 선택한 사진의 PC 스코어 계산
+    query_vec <- selected_shoe_vec()
+    query_centered <- query_vec - x_bar
+    query_pc1 <- sum(query_centered * pca_result$rotation[, 1])
+    query_pc2 <- sum(query_centered * pca_result$rotation[, 2])
+    
+    # [수정 2] 카테고리별 색상 (반투명, 검정·노랑은 쓰지 않음 -> 내 사진 표시와 겹치지 않음)
+    cat_cols <- c(Boots = "#1f77b4", Sandals = "#2ca02c", Shoes = "#ff7f0e", Slippers = "#9467bd")
+    cat_cols <- cat_cols[sort(unique(meta$category))]
+    
+    plot(pc1, pc2, col = adjustcolor(cat_cols[meta$category], alpha.f = 0.45), pch = 16, cex = 0.8,
+         main = "Score Map (PC1 vs PC2)", xlab = "PC1 Score", ylab = "PC2 Score")
+    
+    # [수정 2] 내 사진: 카테고리에 쓰지 않은 색(검정 바탕 + 노란 테두리)의 큰 마름모 + 글자
+    points(query_pc1, query_pc2, pch = 23, bg = "black", col = "yellow", cex = 3, lwd = 3)
+    text(query_pc1, query_pc2, labels = "Your photo", pos = 3, offset = 1.2, font = 2, cex = 1.1)
+    
+    legend("topright", legend = c(names(cat_cols), "Your photo"),
+           col = c(cat_cols, "yellow"), pt.bg = c(rep(NA, length(cat_cols)), "black"),
+           pch = c(rep(16, length(cat_cols)), 23), pt.cex = c(rep(1, length(cat_cols)), 1.6),
+           cex = 0.8, bg = "white")
+  })
+  
+  # Step 4. Eigenshoes (PC1, PC2의 고유벡터 이미지)
+  output$pca_step4 <- renderPlot({
+    # [수정 3] 처음 10개 PC를 2x5 격자로, 제목에 설명 분산(%) 표시, 부호를 보여주는 파랑-흰색-빨강 팔레트
+    n_show <- 10
+    var_exp <- pca_result$sdev^2 / sum(pca_result$sdev^2)       # 각 PC의 설명 분산 비율
+    pal <- colorRampPalette(c("blue", "white", "red"))(101)
+    
+    par(mfrow = c(2, 5), mar = c(1, 1, 3, 1))
+    for (k in 1:n_show) {
+      v <- pca_result$rotation[, k]
+      m <- matrix(v, 64, 64, byrow = TRUE)
+      lim <- max(abs(v))                                        # 0이 흰색이 되도록 좌우 대칭 범위
+      image(t(apply(m, 2, rev)), col = pal, zlim = c(-lim, lim), axes = FALSE, asp = 1,
+            main = sprintf("PC%d (%.1f%%)", k, 100 * var_exp[k]))
     }
   })
   
-  accuracy_result <- eventReactive(input$run_acc, {
-    withProgress(message = "Computing leave-one-out accuracy", value = 0, {
-      compute_loo_accuracy(function(k) {
-        incProgress(1 / K_MAX, detail = paste("K =", k))
-      })
+  # Step 5. Scores (선택한 사진의 첫 K개 PC 스코어 표)
+  output$pca_step5_table <- renderTable({
+    query_vec <- selected_shoe_vec()
+    query_centered <- query_vec - x_bar
+    K <- input$K          # [수정 4] 슬라이더 K개 전부 표시 (이전: 최대 10개)
+    scores <- query_centered %*% pca_result$rotation[, 1:K]
+    
+    data.frame(
+      PC = paste0("PC", 1:K),
+      Score = round(as.vector(scores), 2)
+    )
+  }, striped = TRUE, hover = TRUE)
+  
+  # Step 6. Rebuild (다양한 K에 따른 복원 이미지 비교)
+  output$pca_step6 <- renderPlot({
+    query_vec <- selected_shoe_vec()
+    query_centered <- query_vec - x_bar
+    
+    # [수정 6] 비교할 K 값들: 고정값(1, 5, 20, 50) + 슬라이더로 고른 K (중복이면 한 번만, 작은 순서로 정렬)
+    k_values <- sort(unique(c(1, 5, 20, min(50, ncol(pca_result$rotation)), input$K)))
+    
+    par(mfrow = c(1, length(k_values)), mar = c(2, 2, 3, 2))
+    for (k in k_values) {
+      scores <- query_centered %*% pca_result$rotation[, 1:k]
+      rebuilt_vec <- x_bar + scores %*% t(pca_result$rotation[, 1:k])
+      rebuilt_mat <- matrix(rebuilt_vec, 64, 64, byrow = TRUE)
+      
+      is_sel <- (k == input$K)                   # 내가 고른 K인지
+      image(t(apply(rebuilt_mat, 2, rev)), col = gray(0:100/100), axes = FALSE, asp = 1,
+            main = paste0("Rebuilt (K=", k, ")", if (is_sel) "\n(your K)" else ""),
+            col.main = if (is_sel) "red" else "black")   # 내가 고른 K는 제목을 빨간색으로 강조
+    }
+  })
+  
+  # [수정 9] K별 예측 정확도 (버튼을 누르면 계산, 결과는 저장되어 다시 계산하지 않음)
+  acc_result <- eventReactive(input$run_acc, {
+    withProgress(message = "Computing accuracy for K = 1 to 100", value = 0, {
+      compute_loo_acc(function(k) incProgress(1/100, detail = paste("K =", k)))
     })
   })
   
   output$acc_plot <- renderPlot({
-    validate(need(input$run_acc > 0,
-                  "Click the button to calculate accuracy across K values."))
-    result <- accuracy_result()
-    best_k <- which.max(result$overall)
-    plot(
-      result$K, 100 * result$overall, type = "l", lwd = 3,
-      ylim = c(0, 100),
-      xlab = "Number of PCs (K)", ylab = "Accuracy (%)",
-      main = "Catalogue leave-one-out accuracy"
-    )
-    for (j in seq_along(category_levels)) {
-      lines(result$K, 100 * result$by_cat[, j],
-            col = category_colors[j], lwd = 1.5, lty = 2)
-    }
-    abline(v = input$K, col = "red", lty = 3)
-    points(input$K, 100 * result$overall[input$K], col = "red", pch = 19)
-    points(best_k, 100 * result$overall[best_k], pch = 8, cex = 2)
-    legend(
-      "bottomright", bg = "white", cex = 0.8,
-      legend = c("Overall", category_levels,
-                 paste("Selected K =", input$K), paste("Best K =", best_k)),
-      col = c("black", unname(category_colors), "red", "black"),
-      lty = c(1, rep(2, length(category_levels)), 3, NA),
-      lwd = c(3, rep(1.5, length(category_levels)), 1, NA),
-      pch = c(NA, rep(NA, length(category_levels)), NA, 8)
-    )
+    validate(need(!is.null(input$run_acc) && input$run_acc > 0, "Click the button above to compute the accuracy."))
+    r <- acc_result()
+    cat_cols <- c(Boots = "#1f77b4", Sandals = "#2ca02c", Shoes = "#ff7f0e", Slippers = "#9467bd")
+    cats <- colnames(r$by_cat)
+    
+    par(mfrow = c(1, 1), mar = c(4.5, 4.5, 3, 1))
+    plot(r$K, 100 * r$overall, type = "l", lwd = 3, ylim = c(0, 100),
+         xlab = "Number of PCs (K)", ylab = "Prediction accuracy (%)",
+         main = "Leave-one-out accuracy on the 2,000 catalogue photos")
+    for (j in seq_along(cats))                                   # categories: thin dashed lines
+      lines(r$K, 100 * r$by_cat[, j], col = cat_cols[cats[j]], lwd = 1.5, lty = 2)
+    abline(v = input$K, col = "red", lty = 3)                    # selected K
+    points(input$K, 100 * r$overall[input$K], pch = 19, col = "red", cex = 1.6)
+    
+    # [수정 10] 정확도가 가장 높은 K를 별(★)과 글자로 표시 (같은 값이 여러 개면 가장 작은 K)
+    best     <- which.max(r$overall)
+    best_acc <- 100 * r$overall[best]
+    points(best, best_acc, pch = 8, col = "black", cex = 2.2, lwd = 2)
+    text(best, best_acc, labels = sprintf("Best K = %d (%.1f%%)", best, best_acc),
+         pos = if (best_acc > 90) 1 else 3, offset = 1, font = 2, cex = 1)
+    
+    legend("bottomright", bg = "white", cex = 0.85,
+           legend = c("Overall", cats, paste0("Selected K = ", input$K), paste0("Best K = ", best)),
+           col = c("black", cat_cols[cats], "red", "black"),
+           lwd = c(3, rep(1.5, length(cats)), NA, NA),
+           lty = c(1, rep(2, length(cats)), NA, NA),
+           pch = c(NA, rep(NA, length(cats)), 19, 8))
   })
   
   output$acc_text <- renderText({
-    req(input$run_acc > 0)
-    result <- accuracy_result()
-    best_k <- which.max(result$overall)
-    sprintf(
-      "Selected K = %d: %.1f%% accuracy (%d of %d). Highest catalogue leave-one-out accuracy: %.1f%% at K = %d.",
-      input$K, 100 * result$overall[input$K],
-      as.integer(round(result$overall[input$K] * nrow(shoes_meta))),
-      nrow(shoes_meta), 100 * result$overall[best_k], best_k
-    )
+    req(input$run_acc)
+    r <- acc_result()
+    best <- which.max(r$overall)
+    sprintf("At the selected K = %d, the app predicts the correct category for %.1f%% of the catalogue photos (%d of 2,000). The highest accuracy is %.1f%% at K = %d.",
+            input$K, 100 * r$overall[input$K], round(r$overall[input$K] * 2000),
+            100 * r$overall[best], best)
   })
   
-  # OUR SHOES ------------------------------------------------
-  ours <- reactiveValues(
-    df = initial_our$df,
-    X = initial_our$X,
-    message = "",
-    preferred = if (nrow(initial_our$df)) initial_our$df$file[1] else ""
-  )
-  
-  observeEvent(input$our_upload, {
-    uploads <- input$our_upload
-    req(nrow(uploads) > 0)
-    new <- empty_our()
-    messages <- character(0)
-    
-    for (j in seq_len(nrow(uploads))) {
-      vector <- tryCatch(
-        read_external_vector(uploads$datapath[j]),
-        error = function(e) NULL
-      )
-      if (is.null(vector)) {
-        messages <- c(messages,
-                      paste("Skipped unreadable image:", uploads$name[j]))
-        next
-      }
-      
-      details <- parse_our_filename(uploads$name[j])
-      new$df <- rbind(new$df, data.frame(
-        file = uploads$name[j], name = details$name,
-        category = details$category, stringsAsFactors = FALSE
-      ))
-      new$X <- rbind(new$X, vector)
-      if (is.na(details$category)) {
-        messages <- c(messages, paste(
-          uploads$name[j], "has no valid category in its filename; ground truth is unknown."
-        ))
-      }
+  # [수정 11] Our Shoes 탭 ---------------------------------------------------------
+  output$our_shoes_ui <- renderUI({
+    if (nrow(our) == 0) {
+      return(p(strong("No photos found. Put the photos in a folder named 'ourshoes' next to app.R, named Name_Category_Number.jpg (e.g., Whae_Sandals_1.jpg), then restart the app.")))
     }
-    
-    if (nrow(new$df) > 0L) {
-      # Replace images with the same filename rather than duplicating them.
-      keep <- !(ours$df$file %in% new$df$file)
-      ours$df <- rbind(ours$df[keep, , drop = FALSE], new$df)
-      ours$X <- rbind(ours$X[keep, , drop = FALSE], new$X)
-      ours$preferred <- new$df$file[1]
-    }
-    ours$message <- paste(
-      c(sprintf("Added %d photo(s).", nrow(new$df)), messages),
-      collapse = "\n"
-    )
-  })
-  
-  observeEvent(input$our_reset, {
-    ours$df <- initial_our$df
-    ours$X <- initial_our$X
-    ours$preferred <- if (nrow(initial_our$df)) initial_our$df$file[1] else ""
-    ours$message <- "Removed temporary uploads. Folder photos are preserved."
-  })
-  
-  output$our_upload_msg <- renderUI({
-    if (!nzchar(ours$message)) return(NULL)
-    p(style = "white-space: pre-line;", ours$message)
-  })
-  
-  output$our_empty_msg <- renderUI({
-    if (nrow(ours$df) > 0L) return(NULL)
-    p("No personal shoes yet. Upload photos or add JPG/PNG files to the ourshoes folder.")
-  })
-  
-  observe({
-    data <- ours$df
-    
-    # A new installation may have no photos in the ourshoes folder.
-    # Do not construct dropdown labels from an empty data frame:
-    # paste0() with literal separators can return one label even when
-    # data$file has zero elements, making setNames() fail.
-    if (nrow(data) == 0L) {
-      updateSelectInput(
-        session, "our_pick",
-        choices = character(0),
-        selected = character(0)
-      )
-      return(invisible(NULL))
-    }
-    
-    labels <- paste0(
-      data$name, " - ",
-      ifelse(is.na(data$category), "Unknown", data$category),
-      " (", data$file, ")"
-    )
-    choices <- stats::setNames(data$file, labels)
-    chosen <- if (ours$preferred %in% data$file) {
-      ours$preferred
-    } else {
-      data$file[1]
-    }
-    updateSelectInput(session, "our_pick", choices = choices, selected = chosen)
-  })
-  
-  our_index <- reactive({
-    req(input$our_pick)
-    index <- match(input$our_pick, ours$df$file)
-    validate(need(!is.na(index), "Choose a personal shoe first."))
-    index
-  })
-  
-  our_result <- reactive({
-    find_similar_shoes(as.numeric(ours$X[our_index(), ]), input$K)
-  })
-  
-  output$our_prediction <- renderUI({
-    index <- our_index()
-    result <- our_result()
-    actual <- ours$df$category[index]
-    verdict <- if (is.na(actual)) "Unknown" else if (
-      tolower(actual) == tolower(result$prediction)
-    ) "Correct" else "Incorrect"
     tagList(
-      p(strong("Predicted: "), result$prediction),
-      p(strong("Actual: "), if (is.na(actual)) "Not available" else actual),
-      p(strong("Result: "), verdict)
+      h4("All our shoes"),
+      p("Each photo is shown as the app sees it (squared to 64 × 64, grayscale), with the member's name and the shoe's category."),
+      plotOutput("our_grid", height = "auto"),
+      hr(),
+      selectInput("our_pick", "Choose a shoe",
+                  choices = setNames(our$file, paste0(our$name, " - ", our$category, " (", our$file, ")")),
+                  width = "500px"),
+      textOutput("our_pred"),
+      plotOutput("our_best_plot", height = "320px"),
+      h4("Top 5 Closest Shoes"),
+      tableOutput("our_top5_table"),
+      plotOutput("our_top5_plot", height = "220px"),
+      hr(),
+      h4("Result for all our shoes at the selected K"),
+      textOutput("our_summary"),
+      tableOutput("our_all_table")
     )
+  })
+  
+  # 전체 사진 목록 (6열 격자, 행 수에 맞춰 높이가 자동으로 정해짐)
+  output$our_grid <- renderPlot({
+    n  <- nrow(our)
+    nc <- min(n, 6)
+    nr <- ceiling(n / nc)
+    par(mfrow = c(nr, nc), mar = c(1, 1, 3, 1))
+    for (i in seq_len(n)) draw_gray(our_mat[i, ], main = paste0(our$name[i], "\n", our$category[i]))
+  }, height = function() 200 * ceiling(max(nrow(our), 1) / min(max(nrow(our), 1), 6)))
+  
+  our_idx <- reactive({ req(input$our_pick); match(input$our_pick, our$file) })
+  our_res <- reactive({ find_top5(our_mat[our_idx(), ], input$K) })
+  
+  output$our_pred <- renderText({
+    pred   <- predict_cat(our_res())
+    actual <- our$category[our_idx()]
+    verdict <- if (is.na(actual)) "Actual category unknown (check the file name)"
+    else if (pred == actual) "Right" else "Wrong"
+    paste0("Predicted category: ", pred, " | Actual category: ", actual, " -> ", verdict)
   })
   
   output$our_best_plot <- renderPlot({
-    index <- our_index()
-    result <- our_result()
-    best_row <- match(result$best_id, shoes_meta$id)
-    old <- par(mfrow = c(1, 2), mar = c(1, 1, 3, 1))
-    on.exit(par(old))
-    plot_shoe(ours$X[index, ], "Selected personal shoe")
-    plot_shoe(pca_data$X[best_row, ],
-              paste("Closest twin | ID", result$best_id))
+    i <- our_idx(); r <- our_res()
+    par(mfrow = c(1, 2), mar = c(2, 1, 3, 1))
+    draw_gray(our_mat[i, ], main = paste0(our$name[i], " - ", our$category[i]))
+    draw_gray(shoe_matrix[r$ID[1], ], main = "Closest tiwn",       # 제목은 과제 문구 그대로 (오타 아님, 수정 금지)
+              sub = paste0("ID ", r$ID[1], " - ", r$Category[1]))
   })
   
-  output$our_top5_table <- renderTable(our_result()$top5,
-                                       striped = TRUE, bordered = TRUE)
+  output$our_top5_table <- renderTable({ our_res() })
   
   output$our_top5_plot <- renderPlot({
-    results <- our_result()$top5
-    old <- par(mfrow = c(1, NEIGHBORS), mar = c(1, 1, 3, 1))
-    on.exit(par(old))
-    for (j in seq_len(NEIGHBORS)) {
-      row <- match(results$ID[j], shoes_meta$id)
-      plot_shoe(pca_data$X[row, ],
-                paste0("#", j, " ID ", results$ID[j],
-                       "\n", results$Category[j]))
-    }
+    r <- our_res()
+    par(mfrow = c(1, 5), mar = c(1, 1, 3, 1))
+    for (j in 1:5) draw_gray(shoe_matrix[r$ID[j], ], main = paste0("#", j, "  ID ", r$ID[j], "\n", r$Category[j]))
   })
   
-  output$our_grid <- renderPlot({
-    validate(need(nrow(ours$df) > 0L, "No personal shoes to display."))
-    n <- nrow(ours$df)
-    columns <- min(n, 6L)
-    rows <- ceiling(n / columns)
-    old <- par(mfrow = c(rows, columns), mar = c(1, 1, 3, 1))
-    on.exit(par(old))
-    for (i in seq_len(n)) {
-      plot_shoe(ours$X[i, ], paste0(ours$df$name[i], "\n",
-                                    ifelse(is.na(ours$df$category[i]),
-                                           "Unknown", ours$df$category[i])))
-    }
-  }, height = function() {
-    n <- max(nrow(ours$df), 1L)
-    200 * ceiling(n / min(n, 6L))
-  })
-  
-  our_all_results <- reactive({
-    req(nrow(ours$df) > 0L)
-    predictions <- vapply(seq_len(nrow(ours$df)), function(i) {
-      find_similar_shoes(as.numeric(ours$X[i, ]), input$K)$prediction
-    }, character(1))
-    actual <- ours$df$category
-    verdict <- ifelse(
-      is.na(actual), "Unknown",
-      ifelse(tolower(predictions) == tolower(actual), "Correct", "Incorrect")
-    )
-    data.frame(
-      Name = ours$df$name, File = ours$df$file,
-      Actual = ifelse(is.na(actual), "Unknown", actual),
-      Predicted = predictions, Result = verdict,
-      row.names = NULL
-    )
+  our_all <- reactive({
+    K <- input$K
+    pred <- vapply(seq_len(nrow(our)), function(i) predict_cat(find_top5(our_mat[i, ], K)), character(1))
+    data.frame(Name = our$name, File = our$file, Actual = our$category, Predicted = pred,
+               Result = ifelse(is.na(our$category), "Unknown", ifelse(pred == our$category, "Right", "Wrong")),
+               stringsAsFactors = FALSE)
   })
   
   output$our_summary <- renderText({
-    results <- our_all_results()
-    known <- results$Result != "Unknown"
-    sprintf(
-      "K = %d: %d of %d personal shoes with known categories were classified correctly (%d unknown).",
-      input$K, sum(results$Result == "Correct"), sum(known), sum(!known)
-    )
+    d <- our_all()
+    known <- d$Result != "Unknown"
+    sprintf("K = %d: %d of %d shoes predicted correctly.", input$K, sum(d$Result == "Right"), sum(known))
   })
   
-  output$our_all_table <- renderTable(our_all_results(),
-                                      striped = TRUE, bordered = TRUE)
+  output$our_all_table <- renderTable({ our_all() })
   
-  # DATA 1 ---------------------------------------------------
-  data1_raw <- reactive({
-    req(input$data1_file)
-    result <- tryCatch(
-      read.csv(input$data1_file$datapath, stringsAsFactors = FALSE,
-               check.names = FALSE),
-      error = function(e) NULL
-    )
-    validate(need(!is.null(result) && ncol(result) > 0L,
-                  "Please upload a readable CSV dataset."))
-    result
-  })
+  # ==================================
+  # Finding A: English Usage Over Time
+  # ==================================
   
-  observeEvent(data1_raw(), {
-    data <- data1_raw()
-    cat_columns <- names(data)[vapply(data, function(x) {
-      is.character(x) || is.factor(x) || is.logical(x)
-    }, logical(1))]
-    number_columns <- names(data)[vapply(data, is.numeric, logical(1))]
-    updateSelectInput(session, "data1_group",
-                      choices = c("No grouping" = "", setNames(names(data), names(data))),
-                      selected = "")
-    updateSelectInput(session, "data1_filter",
-                      choices = c("No filter" = "", setNames(cat_columns, cat_columns)),
-                      selected = "")
-    updateSelectInput(session, "data1_measure",
-                      choices = c("Row count only" = "", setNames(number_columns, number_columns)),
-                      selected = "")
-  })
-  
-  observeEvent(list(data1_raw(), input$data1_filter), {
-    data <- data1_raw()
-    column <- input$data1_filter
-    values <- if (!is.null(column) && nzchar(column) && column %in% names(data)) {
-      sort(unique(as.character(data[[column]][!is.na(data[[column]])])))
-    } else {
-      character(0)
-    }
-    updateSelectInput(session, "data1_value",
-                      choices = c("All values" = "", setNames(values, values)),
-                      selected = "")
-  })
-  
-  data1_filtered <- reactive({
-    data <- data1_raw()
-    column <- input$data1_filter
-    value <- input$data1_value
-    if (!is.null(column) && nzchar(column) && column %in% names(data) &&
-        !is.null(value) && nzchar(value)) {
-      data <- data[!is.na(data[[column]]) &
-                     as.character(data[[column]]) == value, , drop = FALSE]
-    }
-    data
-  })
-  
-  output$data1_preview <- renderTable({
-    head(data1_filtered(), 12)
-  }, striped = TRUE, bordered = TRUE)
-  
-  output$data1_summary <- renderTable({
-    data <- data1_filtered()
-    group_name <- input$data1_group
-    measure <- input$data1_measure
-    if (is.null(group_name) || !(group_name %in% names(data))) group_name <- ""
-    if (is.null(measure) || !(measure %in% names(data)) ||
-        !is.numeric(data[[measure]])) measure <- ""
-    
-    group_values <- if (nzchar(group_name)) {
-      ifelse(is.na(data[[group_name]]), "(Missing)",
-             as.character(data[[group_name]]))
-    } else {
-      rep("All rows", nrow(data))
-    }
-    levels <- unique(group_values)
-    if (!length(levels)) return(data.frame(Message = "No rows match the filter."))
-    
-    do.call(rbind, lapply(levels, function(level) {
-      keep <- group_values == level
-      values <- if (nzchar(measure)) data[[measure]][keep] else numeric(0)
-      observed <- values[is.finite(values)]
-      data.frame(
-        Group = level,
-        Count = sum(keep),
-        Mean = if (nzchar(measure) && length(observed)) round(mean(observed), 3) else NA_real_,
-        Median = if (nzchar(measure) && length(observed)) round(median(observed), 3) else NA_real_,
-        Minimum = if (nzchar(measure) && length(observed)) min(observed) else NA_real_,
-        Maximum = if (nzchar(measure) && length(observed)) max(observed) else NA_real_,
-        row.names = NULL
+  # 선택한 연도 범위 + 규칙(여러 개 가능) + HYBE 선택을 반영한 표
+  a_long <- reactive({
+    validate(need(length(input$a_rules) > 0, "Please choose at least one counting rule."))
+    rules <- names(RULE_COLS)[names(RULE_COLS) %in% input$a_rules]
+    d <- lyrics %>%
+      filter(
+        year >= input$year_range[1],
+        year <= input$year_range[2]
       )
-    }))
-  }, striped = TRUE, bordered = TRUE)
-  
-  output$data1_description <- renderText({
-    data <- data1_filtered()
-    sprintf("The current filter contains %d rows and %d columns. Statistics are descriptive only; they do not establish causation.",
-            nrow(data), ncol(data))
+    make_long(d, rules, isTRUE(input$a_hive))
   })
   
-  # AI DOCUMENTATION -----------------------------------------
-  output$ai_table <- renderTable({
-    data.frame(
-      Tab = c("Shoe Search", "Explain PCA", "Our Shoes", "Data 1"),
-      `What AI Did (Draft)` = c(
-        "Combined catalogue search, caching, image conversion, and result display.",
-        "Combined PCA explanation plots, reconstruction, and leave-one-out evaluation.",
-        "Combined multi-upload handling, previews, and prediction summaries.",
-        "Implemented optional CSV descriptive summaries."
-      ),
-      `What the Team Did` = rep(
-        "TODO: each team member must verify and describe their actual work.", 4
-      ),
-      check.names = FALSE
-    )
-  }, striped = TRUE, bordered = TRUE)
+  output$a_stats <- renderUI({
+    long <- a_long()
+    validate(need(nrow(long) > 0, "No songs match the selected options."))
+    s <- long %>%
+      group_by(series) %>%
+      summarise(
+        n = n(),
+        mean_pct = mean(pct),
+        median_pct = median(pct),
+        .groups = "drop"
+      )
+    stat_rows(s)
+  })
   
-  output$ai_reflection <- renderTable({
-    data.frame(
-      Member = c("박선우", "송현정", "한우영", "신유진", "Flo"),
-      Reflection = rep(
-        "TODO: write and verify your own reflection on AI assistance, mistakes, and learning.", 5
-      ),
-      check.names = FALSE
-    )
-  }, striped = TRUE, bordered = TRUE)
+  output$year_plot <- renderPlot({
+    long <- a_long()
+    validate(need(nrow(long) > 0, "No songs match the selected options."))
+    plot_data <- long %>%
+      group_by(year, series) %>%
+      summarise(
+        mean_pct = mean(pct),
+        .groups = "drop"
+      )
+    
+    ggplot(plot_data, aes(x = year, y = mean_pct, colour = series, group = series)) +
+      geom_line(linewidth = 1) +
+      geom_point(size = 3) +
+      scale_x_continuous(breaks = sort(unique(plot_data$year))) +
+      labs(
+        title = "Average English Percentage in K-pop Lyrics",
+        x = "Year",
+        y = "English Percentage (%)",
+        colour = NULL
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(legend.position = if (length(unique(plot_data$series)) > 1) "bottom" else "none")
+  })
+  
+  # ==================================
+  # HYBE vs Non-HYBE comparison (shown inside Finding A)
+  # ==================================
+  
+  hive_data <- reactive({
+    if (input$hive_group == "all") {
+      return(lyrics)
+    }
+    
+    lyrics %>%
+      filter(is_hive == input$hive_group)
+  })
+  
+  output$hive_count <- renderText({
+    nrow(hive_data())
+  })
+  
+  output$hive_mean <- renderText({
+    round(mean(hive_data()$pct_main), 2)
+  })
+  
+  output$hive_median <- renderText({
+    round(median(hive_data()$pct_main), 2)
+  })
+  
+  output$hive_plot <- renderPlot({
+    plot_data <- lyrics %>%
+      group_by(is_hive) %>%
+      summarise(
+        mean_pct = mean(pct_main),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        group = ifelse(is_hive == "true", "HYBE", "Non-HYBE")
+      )
+    
+    ggplot(plot_data, aes(x = group, y = mean_pct, fill = group)) +
+      geom_col(width = 0.6) +
+      geom_text(
+        aes(label = paste0(round(mean_pct, 2), "%")),
+        vjust = -0.5,
+        size = 5
+      ) +
+      labs(
+        title = "Average English Percentage by Group",
+        x = "Group",
+        y = "Mean English Percentage (%)"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(legend.position = "none")
+  })
+  
+  # ==================================
+  # Finding B: English-centered songs by year (bar chart)
+  # ==================================
+  
+  c_long <- reactive({
+    make_long(lyrics, "main", isTRUE(input$c_hive))
+  })
+  
+  output$c_stats <- renderUI({
+    long <- c_long()
+    validate(need(nrow(long) > 0, "No songs match the selected options."))
+    thr <- input$c_thr
+    s <- long %>%
+      group_by(series) %>%
+      summarise(
+        n = n(),
+        mean_pct = mean(pct),
+        median_pct = median(pct),
+        share_thr = mean(pct >= thr) * 100,
+        .groups = "drop"
+      )
+    stat_rows(s, thr = thr)
+  })
+  
+  output$c_plot <- renderPlot({
+    long <- c_long()
+    validate(need(nrow(long) > 0, "No songs match the selected options."))
+    thr <- input$c_thr
+    plot_data <- long %>%
+      group_by(year, series) %>%
+      summarise(
+        share = mean(pct >= thr) * 100,
+        .groups = "drop"
+      )
+    plot_data$year_f <- factor(plot_data$year)
+    
+    ggplot(plot_data, aes(x = year_f, y = share, fill = series)) +
+      geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+      geom_text(
+        aes(label = paste0(round(share, 1), "%")),
+        position = position_dodge(width = 0.8),
+        vjust = -0.5,
+        size = 3.3
+      ) +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+      labs(
+        title = paste0("Songs with at least ", thr, "% English Words, by Year"),
+        x = "Year",
+        y = "Share of songs (%)",
+        fill = NULL
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(legend.position = if (length(unique(plot_data$series)) > 1) "bottom" else "none")
+  })
 }
 
-# 9. START APPLICATION ---------------------------------------
-shinyApp(ui = ui, server = server)
+
+shinyApp(ui, server)
