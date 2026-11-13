@@ -27,9 +27,6 @@ PIXEL_COUNT <- IMAGE_SIDE * IMAGE_SIDE
 NEIGHBORS <- 5L
 MAX_PCS <- 100L
 CACHE_VERSION <- "column-major-png-grayscale-v2"
-# Uploaded photos are downscaled to this size (longest side) for cropping.
-CROP_WORKING_SIDE <- 1000L
-MIN_CROP_SIDE <- 8L
 
 # 2. PROJECT FOLDERS -----------------------------------------
 # Catalogue and personal shoe images live inside data/ alongside CSV files.
@@ -116,32 +113,6 @@ read_png_vector <- function(path) {
   as.numeric(round(pmax(0, pmin(1, img)) * 255))
 }
 
-# Apply camera orientation and replace transparency with a white background.
-prepare_external_image <- function(img) {
-  img <- magick::image_orient(img)
-  magick::image_background(img, "white", flatten = TRUE)
-}
-
-# Pad a prepared magick image to a square without stretching, resize it to
-# 64 x 64, convert to grayscale, and decode it with the same PNG reader
-# used for the catalogue.
-image_to_vector <- function(img) {
-  img <- magick::image_repage(img)
-  dims <- magick::image_info(img)
-  side <- max(dims$width[1], dims$height[1])
-  img <- magick::image_extent(
-    img, geometry = paste0(side, "x", side),
-    gravity = "center", color = "white"
-  )
-  img <- magick::image_resize(img, "64x64!")
-  img <- magick::image_convert(img, colorspace = "gray")
-  
-  temporary_png <- tempfile(pattern = "preprocess_", tmpdir = TEMP_DIR, fileext = ".png")
-  on.exit(unlink(temporary_png), add = TRUE)
-  magick::image_write(img, path = temporary_png, format = "png", depth = 8)
-  read_png_vector(temporary_png)
-}
-
 read_external_vector <- function(path) {
   # Convert real photographs in a consistent way: orient, flatten alpha,
   # pad to a square without stretching, resize and convert to grayscale.
@@ -156,23 +127,21 @@ read_external_vector <- function(path) {
     if (!is.null(exact_vector)) return(exact_vector)
   }
   
-  image_to_vector(prepare_external_image(img))
-}
-
-# Convert a Shiny brush (plot coordinates, origin at bottom-left) into a
-# crop region in image pixels (origin at top-left).
-brush_to_crop <- function(brush, width, height) {
-  x0 <- max(0, floor(brush$xmin))
-  x1 <- min(width, ceiling(brush$xmax))
-  top <- max(0, floor(height - brush$ymax))
-  bottom <- min(height, ceiling(height - brush$ymin))
-  crop_width <- x1 - x0
-  crop_height <- bottom - top
-  if (crop_width < MIN_CROP_SIDE || crop_height < MIN_CROP_SIDE) return(NULL)
-  list(
-    x = x0, y = top, width = crop_width, height = crop_height,
-    geometry = sprintf("%dx%d+%d+%d", crop_width, crop_height, x0, top)
+  img <- magick::image_orient(img)
+  img <- magick::image_background(img, "white", flatten = TRUE)
+  dims <- magick::image_info(img)
+  side <- max(dims$width[1], dims$height[1])
+  img <- magick::image_extent(
+    img, geometry = paste0(side, "x", side),
+    gravity = "center", color = "white"
   )
+  img <- magick::image_resize(img, "64x64!")
+  img <- magick::image_convert(img, colorspace = "gray")
+  
+  temporary_png <- tempfile(pattern = "preprocess_", tmpdir = TEMP_DIR, fileext = ".png")
+  on.exit(unlink(temporary_png), add = TRUE)
+  magick::image_write(img, path = temporary_png, format = "png", depth = 8)
+  read_png_vector(temporary_png)
 }
 
 save_vector_png <- function(vector) {
@@ -626,54 +595,21 @@ lyrics_stat_cards <- function(summary_table, threshold = NULL) {
 
 # Show data-dependent endpoint comparisons without calling them trends.
 # Each series uses its first and last available year, not extrapolated values.
-lyrics_year_change_notes <- function(yearly, column, measure_label) {
-  # Keep the series order used in the chart legend.
-  series_names <- if (is.factor(yearly$series)) {
-    levels(droplevels(yearly$series))
-  } else {
-    unique(as.character(yearly$series))
-  }
-
-  cards <- lapply(series_names, function(group_name) {
-    rows <- yearly[as.character(yearly$series) == group_name, , drop = FALSE]
+lyrics_year_change_notes <- function(yearly, column) {
+  groups <- split(yearly, as.character(yearly$series), drop = TRUE)
+  tagList(lapply(names(groups), function(group_name) {
+    rows <- groups[[group_name]]
     rows <- rows[order(rows$year), , drop = FALSE]
-
     if (nrow(rows) < 2L) {
-      return(div(
-        class = "d1-change-card",
-        div(class = "d1-change-series", group_name),
-        div(class = "d1-change-note",
-            "Only one year is available for the current selection.")
-      ))
+      return(p(strong(paste0(group_name, ": ")),
+               "Only one year is available for the current selection."))
     }
-
     first <- rows[[column]][1]
     last <- rows[[column]][nrow(rows)]
-    change <- last - first
-    direction <- if (abs(change) < 0.05) "flat" else if (change > 0) "up" else "down"
-    arrow <- c(up = "▲", down = "▼", flat = "■")[[direction]]
-
-    div(
-      class = "d1-change-card",
-      div(class = "d1-change-series", group_name),
-      div(class = "d1-change-measure", measure_label),
-      div(
-        class = "d1-change-years",
-        div(class = "d1-change-point",
-            div(class = "d1-change-year", rows$year[1]),
-            div(class = "d1-change-value", sprintf("%.1f%%", first))),
-        div(class = "d1-change-arrow", "→"),
-        div(class = "d1-change-point",
-            div(class = "d1-change-year", rows$year[nrow(rows)]),
-            div(class = "d1-change-value", sprintf("%.1f%%", last)))
-      ),
-      div(
-        class = paste("d1-change-delta", direction),
-        sprintf("%s %+.1f percentage points", arrow, change)
-      )
-    )
-  })
-  div(class = "d1-change-grid", cards)
+    p(strong(paste0(group_name, ": ")),
+      sprintf("%d: %.1f%%; %d: %.1f%%. Change: %+.1f percentage points.",
+              rows$year[1], first, rows$year[nrow(rows)], last, last - first))
+  }))
 }
 
 # Shared theme for Data 1 plots: visually consistent with Flatly cards.
@@ -829,56 +765,6 @@ ui <- page_navbar(
       .d1-stat-grid { grid-template-columns: 1fr 1fr; }
       .d1-stat-value { font-size: 1.25rem; }
     }
-    /* Explain PCA Step 4: colour legend for eigenshoe loadings. */
-    .pca-color-legend { display: grid; gap: 6px; margin: 4px 0 8px; font-size: 0.93rem; }
-    .pca-swatch {
-      display: inline-block; width: 14px; height: 14px; margin-right: 6px;
-      border: 1px solid #b8c4cc; border-radius: 3px; vertical-align: -2px;
-    }
-    /* Data 1: value tooltip for points on the yearly line chart. */
-    .d1-plot-wrap { position: relative; }
-    .d1-plot-tooltip {
-      position: absolute; z-index: 10; pointer-events: none;
-      transform: translate(-50%, calc(-100% - 12px));
-      background: rgba(44, 62, 80, 0.94); color: #fff;
-      padding: 6px 10px; border-radius: 6px;
-      font-size: 0.85rem; white-space: nowrap;
-      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
-    }
-    /* Data 1: first-year vs last-year comparison cards. */
-    .d1-change-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-      gap: 12px;
-      margin: 6px 0 12px;
-    }
-    .d1-change-card {
-      border: 1px solid #dce6ed;
-      border-radius: 10px;
-      background: #f7fafc;
-      padding: 14px 16px;
-    }
-    .d1-change-series { color: #2c3e50; font-weight: 700; font-size: 1.02rem; }
-    .d1-change-measure { color: #617383; font-size: 0.85rem; margin-bottom: 10px; }
-    .d1-change-years { display: flex; align-items: center; gap: 14px; }
-    .d1-change-year { color: #617383; font-size: 0.85rem; }
-    .d1-change-value { color: #2c3e50; font-size: 1.35rem; font-weight: 700; }
-    .d1-change-arrow { color: #93a7b4; font-size: 1.3rem; }
-    .d1-change-delta {
-      display: inline-block;
-      margin-top: 10px;
-      padding: 3px 10px;
-      border-radius: 999px;
-      font-size: 0.87rem;
-      font-weight: 650;
-    }
-    .d1-change-delta.up { background: #e3f6f1; color: #0f7a63; }
-    .d1-change-delta.down { background: #fbe9e7; color: #b03a2e; }
-    .d1-change-delta.flat { background: #edf2f5; color: #576574; }
-    .d1-change-note { color: #576574; font-size: 0.93rem; margin-top: 6px; }
-    /* Shoe Search: manual crop controls for uploaded photos. */
-    .crop-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
-    .crop-status { color: #576574; font-size: 0.93rem; }
   "))),
   
   nav_panel(
@@ -906,9 +792,7 @@ ui <- page_navbar(
           conditionalPanel(
             "input.src == 'Upload'",
             fileInput("photo", "Upload Photo (JPG/PNG)",
-                      accept = c(".jpg", ".jpeg", ".png")),
-            p(class = "shoe-caption",
-              "After uploading, crop the photo around the shoe in the panel on the right for better matches.")
+                      accept = c(".jpg", ".jpeg", ".png"))
           ),
           hr(),
           sliderInput("K", "Number of Principal Components (K)",
@@ -916,27 +800,6 @@ ui <- page_navbar(
           sliderInput("image_size", "Image Size", min = 96, max = 240,
                       value = 160, step = 8, post = " px"),
           uiOutput("image_size_css")
-        ),
-        conditionalPanel(
-          "input.src == 'Upload'",
-          card(
-            fill = FALSE,
-            card_header("Crop the Uploaded Photo"),
-            card_body(
-              fill = FALSE, fillable = FALSE,
-              p(class = "shoe-caption",
-                "Drag a box tightly around the shoe, then click 'Apply crop'. Cropping removes most of the background, so the PCA focuses on the shoe itself. A plain, light background inside the box gives the best results."),
-              plotOutput("upload_crop_plot", height = "360px",
-                         brush = brushOpts("upload_brush", resetOnNew = TRUE,
-                                           fill = "#18BC9C", stroke = "#18BC9C",
-                                           opacity = 0.2)),
-              div(class = "crop-buttons",
-                  actionButton("apply_crop", "Apply crop", class = "btn-primary"),
-                  actionButton("reset_crop", "Use full photo",
-                               class = "btn-outline-secondary")),
-              div(class = "crop-status", textOutput("crop_status"))
-            )
-          )
         ),
         card(
           fill = FALSE,
@@ -985,20 +848,6 @@ ui <- page_navbar(
            plotOutput("pca_step3", height = "410px")),
       card(card_header("Step 4 | First 10 eigenshoes"),
            p("Principal component loadings drawn as 64 x 64 images, with their individual explained variance."),
-           div(
-             class = "pca-color-legend",
-             div(span(class = "pca-swatch", style = "background:#C64342;"),
-                 strong("Red (positive weight): "),
-                 "a shoe with a high score on this PC is brighter than the average shoe in these pixels."),
-             div(span(class = "pca-swatch", style = "background:#245A9C;"),
-                 strong("Blue (negative weight): "),
-                 "a shoe with a high score on this PC is darker than the average shoe in these pixels."),
-             div(span(class = "pca-swatch", style = "background:#FFFFFF;"),
-                 strong("White (near zero): "),
-                 "these pixels barely affect this PC.")
-           ),
-           p(class = "shoe-caption",
-             "For a negative score the effect is reversed. The sign of a PC is arbitrary: what matters is that red and blue regions change in opposite directions, so each eigenshoe describes a contrast between them. Stronger colors mean a larger influence."),
            plotOutput("pca_step4", height = "440px")),
       card(card_header("Step 5 | Query scores"),
            p("The first K PCA coordinates used to calculate nearest-neighbor distances."),
@@ -1129,15 +978,8 @@ ui <- page_navbar(
               ),
               card(
                 card_header("Average English Share by Year"),
-                div(
-                  class = "d1-plot-wrap",
-                  plotOutput("year_plot", height = "410px",
-                             click = "year_plot_click",
-                             hover = hoverOpts("year_plot_hover", delay = 80,
-                                               delayType = "debounce")),
-                  uiOutput("year_plot_tooltip")
-                ),
-                p(class = "shoe-caption", "Each point shows the unweighted mean of song-level English percentages for that year and selected group/rule. Hover over or tap a point to see its value.")
+                plotOutput("year_plot", height = "410px"),
+                p(class = "shoe-caption", "Each point shows the unweighted mean of song-level English percentages for that year and selected group/rule.")
               ),
               card(
                 card_header("Observed Results for Selected Filters"),
@@ -1147,8 +989,31 @@ ui <- page_navbar(
               ),
               card(
                 card_header("Why It Matters and Next Analysis"),
-                p(strong("Why it matters: "), "Comparing counting rules can show how fillers and repeated words affect the measured English share. This dataset describes lyric composition, not whether English lyrics cause greater popularity."),
-                p(strong("How this helps our next analysis: "), "Compare the selected series before deciding whether their patterns differ. Follow up by checking the role of repetition and ad-libs, and use a separate dataset with chart performance metrics to investigate any association with popularity.")
+                
+                p(
+                  strong("Why it matters: "),
+                  "Comparing counting rules can show how fillers and repeated words affect the measured English share. This dataset describes lyric composition, not whether English lyrics cause greater popularity."
+                ),
+                
+                p(strong("How This Helps Our Next Analysis: ")),
+                
+                p(
+                  strong("1. Compare Different Counting Methods"),
+                  br(),
+                  "Compare the results from Main, Sub 1, and Sub 2 to see if the use of English lyrics changes depending on how we count them."
+                ),
+                
+                p(
+                  strong("2. Look at Repeated Lyrics and Ad-libs"),
+                  br(),
+                  "Check how repeated lyrics and short expressions like Oh, Yeah, and La-la affect the percentage of English lyrics."
+                ),
+                
+                p(
+                  strong("3. Compare English Lyrics with Song Popularity"),
+                  br(),
+                  "Use another dataset with music chart information to see if songs with more English lyrics tend to perform better on music charts."
+                )
               ),
               conditionalPanel(
                 "input.a_show_b",
@@ -1237,77 +1102,6 @@ server <- function(input, output, session) {
     ", best_size, size)))
   })
   
-  # UPLOAD CROPPING --------------------------------------------
-  # The uploaded photo is oriented, flattened onto white and downscaled once.
-  # The same working image is used for display and for cropping, so the
-  # brush coordinates always match the pixels that are cropped.
-  upload_image <- reactive({
-    req(input$photo)
-    img <- tryCatch({
-      working <- prepare_external_image(magick::image_read(input$photo$datapath)[1])
-      magick::image_resize(
-        working, paste0(CROP_WORKING_SIDE, "x", CROP_WORKING_SIDE, ">")
-      )
-    }, error = function(e) NULL)
-    validate(need(!is.null(img), "Could not read the uploaded image."))
-    img
-  })
-  
-  upload_crop <- reactiveVal(NULL)
-  
-  # A new photo always starts uncropped.
-  observeEvent(input$photo, upload_crop(NULL))
-  
-  observeEvent(input$apply_crop, {
-    brush <- input$upload_brush
-    if (is.null(brush)) {
-      showNotification("Drag a box around the shoe first.", type = "warning")
-      return()
-    }
-    dims <- magick::image_info(upload_image())
-    region <- brush_to_crop(brush, dims$width[1], dims$height[1])
-    if (is.null(region)) {
-      showNotification("The selected area is too small. Drag a larger box.",
-                       type = "warning")
-      return()
-    }
-    upload_crop(region)
-  })
-  
-  observeEvent(input$reset_crop, upload_crop(NULL))
-  
-  output$upload_crop_plot <- renderPlot({
-    validate(need(input$photo, "Upload a photo in the sidebar to start cropping."))
-    img <- upload_image()
-    dims <- magick::image_info(img)
-    width <- dims$width[1]
-    height <- dims$height[1]
-    
-    old <- par(mar = c(0, 0, 0, 0))
-    on.exit(par(old))
-    plot(NA, xlim = c(0, width), ylim = c(0, height), asp = 1,
-         xaxs = "i", yaxs = "i", axes = FALSE, xlab = "", ylab = "")
-    rasterImage(as.raster(img), 0, 0, width, height)
-    
-    region <- upload_crop()
-    if (!is.null(region)) {
-      rect(region$x, height - region$y - region$height,
-           region$x + region$width, height - region$y,
-           border = "#E74C3C", lwd = 3)
-    }
-  })
-  
-  output$crop_status <- renderText({
-    req(input$photo)
-    region <- upload_crop()
-    if (is.null(region)) {
-      "Currently using the full photo."
-    } else {
-      sprintf("Currently using the cropped area (red box, %d x %d px).",
-              region$width, region$height)
-    }
-  })
-  
   # One query representation is shared by both the Search and Explain PCA tabs.
   query_data <- reactive({
     req(input$src)
@@ -1344,16 +1138,9 @@ server <- function(input, output, session) {
     }
     
     req(input$photo)
-    region <- upload_crop()
-    vector <- if (is.null(region)) {
-      tryCatch(read_external_vector(input$photo$datapath),
-               error = function(e) NULL)
-    } else {
-      tryCatch(
-        image_to_vector(magick::image_crop(upload_image(), region$geometry)),
-        error = function(e) NULL
-      )
-    }
+    vector <- tryCatch(
+      read_external_vector(input$photo$datapath), error = function(e) NULL
+    )
     validate(need(!is.null(vector), "Could not read the uploaded image."))
     list(vector = vector, actual = NA_character_, exclude_id = NULL)
   })
@@ -1681,7 +1468,7 @@ server <- function(input, output, session) {
   })
   
   output$a_observation <- renderUI({
-    lyrics_year_change_notes(a_yearly(), "mean_pct", "Average English share")
+    lyrics_year_change_notes(a_yearly(), "mean_pct")
   })
   
   output$year_plot <- renderPlot({
@@ -1697,28 +1484,6 @@ server <- function(input, output, session) {
       lyrics_plot_theme() +
       ggplot2::theme(legend.position = if (nlevels(data$series) > 1L)
         "bottom" else "none")
-  })
-  
-  # Tooltip for the yearly line chart: hover on desktop, tap on touch screens.
-  output$year_plot_tooltip <- renderUI({
-    event <- input$year_plot_hover
-    if (is.null(event)) event <- input$year_plot_click
-    if (is.null(event) || is.null(event$coords_css)) return(NULL)
-    
-    yearly <- a_yearly()
-    point <- nearPoints(yearly, event, xvar = "year", yvar = "mean_pct",
-                        threshold = 15, maxpoints = 1)
-    if (nrow(point) == 0L) return(NULL)
-    
-    div(
-      class = "d1-plot-tooltip",
-      style = sprintf("left: %.0fpx; top: %.0fpx;",
-                      event$coords_css$x, event$coords_css$y),
-      strong(point$year),
-      if (nlevels(yearly$series) > 1L) span(" · ", as.character(point$series)),
-      br(),
-      sprintf("Average English share: %.1f%%", point$mean_pct)
-    )
   })
   
   hive_filtered <- reactive({
@@ -1782,11 +1547,7 @@ server <- function(input, output, session) {
   })
   
   output$c_observation <- renderUI({
-    req(input$c_thr)
-    lyrics_year_change_notes(
-      c_yearly(), "share",
-      sprintf("Songs with at least %d%% English", input$c_thr)
-    )
+    lyrics_year_change_notes(c_yearly(), "share")
   })
   
   output$c_plot <- renderPlot({
@@ -1810,6 +1571,7 @@ server <- function(input, output, session) {
         "bottom" else "none")
   })
   
+  # AI DOCUMENTATION -----------------------------------------
   # AI DOCUMENTATION -----------------------------------------
   output$ai_table <- renderTable({
     data.frame(
@@ -1847,7 +1609,7 @@ server <- function(input, output, session) {
       Reflection = c(
         "박선우",
         "송현정",
-        "한우영",
+        "During this project, I mainly focused on analyzing the K-pop lyrics dataset and creating visualizations using R Shiny. I worked with Yujin on organizing the lyrics data and finding better ways to visualize changes in English lyric usage over time and differences between HYBE and Non-HYBE artists. I also helped combine different team members' codes into one application and fix errors that occurred during development. Although debugging was sometimes challenging, solving problems step by step helped me understand the code better and improve my coding skills. Through this project, I learned how to turn data into meaningful visualizations and gained more confidence in using R Shiny.",
         "신유진",
         "During this project, I mainly focused on combining our team's code, improving usability, and organizing the application. I worked on creating a consistent interface, improving navigation, cleaning up the folder structure, and testing the different functions.
         \n I used AI to help merge code, improve the R Shiny layout, remove unnecessary code, and fix errors. However, AI-generated solutions did not always work correctly and needed testing and adjustments. I learned that AI is a useful tool for speeding up development, but understanding and verifying the code remains important."
