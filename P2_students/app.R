@@ -1598,6 +1598,3 @@ server <- function(input, output, session) {
 
 # 11. START APPLICATION ---------------------------------------
 shinyApp(ui = ui, server = server)
-
-library(rsconnect)
-rsconnect::writeManifest()
