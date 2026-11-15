@@ -1841,13 +1841,13 @@ server <- function(input, output, session) {
       `What AI Did` = c(
         "Drafted the initial algorithm code to calculate Euclidean distances between image data and extract the top 5 closest matching shoes. It also suggested a foundational Shiny server template to display search results dynamically based on user inputs.",
         "Provided standard code examples for performing principal component analysis (PCA) and extracting scores using built-in R functions. It also generated basic layout code to arrange the 6-step visualization graphs, from the average shoe to reconstructed images, onto a single screen.",
-        "Implemented personal shoe loading, gallery display, and prediction summaries.",
-        "Guided the use of a Shiny UI function (tags$blockquote) to neatly display the ethics statement as a quote block on the screen. It also drafted the basic data frame and table output code to present team roles and reflections in an organized table format."
+        "Generated the initial code for loading personal shoe photos from the directory and converting them into grayscale matrices. It also provided layout templates to display the team's shoe gallery alongside their predicted categories and similarity scores.",
+        "AI assisted in modifying and debugging R code for the K-pop lyrics analysis. It helped calculate English lyric proportions, create visualizations for Analysis 1 and Analysis 2, and organize the analysis results. It also provided suggestions for rearranging outputs and improving the interactive features of the Shiny app."
       ),
       `What the Team Did` = c(
         "The team collaboratively designed the overall app framework and implemented the core code. In the 'Shoe Search' tab, we linked 2,000 shoe images with metadata to build and validate the Top 5 similarity search and category prediction logic using Euclidean distance.",
         "The team structured the 6-step PCA visualization layout ranging from the average shoe and eigenshoes to reconstructed images across K values, directly resolving the matrix orientation issues in the 'image()'funtion to improve the visual output.",
-        "Guided the use of a Shiny UI function (tags$blockquote) to neatly display the ethics statement as a quote block on the screen. It also drafted the basic data frame and table output code to present team roles and reflections in an organized table format.",
+        "The team collected personal shoe images, standardized inconsistent file naming formats to prevent loading errors, and organized the folder structure. We also manually verified that each uploaded photo was properly resized, processed, and matched with accurate category predictions.",
         "The team included the full ethics statement and established the foundational table structure to systematically organize team roles and contributions."
       ),
       check.names = FALSE
