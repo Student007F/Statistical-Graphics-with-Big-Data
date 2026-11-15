@@ -1845,10 +1845,10 @@ server <- function(input, output, session) {
         "AI assisted in modifying and debugging R code for the K-pop lyrics analysis. It helped calculate English lyric proportions, create visualizations for Analysis 1 and Analysis 2, and organize the analysis results. It also provided suggestions for rearranging outputs and improving the interactive features of the Shiny app."
       ),
       `What the Team Did` = c(
-        "The team collaboratively designed the overall app framework and implemented the core code. In the 'Shoe Search' tab, we linked 2,000 shoe images with metadata to build and validate the Top 5 similarity search and category prediction logic using Euclidean distance.",
+        "The team collaboratively designed the overall app framework and revised the core code. In the 'Shoe Search' tab, we linked 2,000 shoe images with metadata to build and validate the Top 5 similarity search and category prediction logic using Euclidean distance.",
         "The team structured the 6-step PCA visualization layout ranging from the average shoe and eigenshoes to reconstructed images across K values, directly resolving the matrix orientation issues in the 'image()'funtion to improve the visual output.",
         "The team collected personal shoe images, standardized inconsistent file naming formats to prevent loading errors, and organized the folder structure. We also manually verified that each uploaded photo was properly resized, processed, and matched with accurate category predictions.",
-        "The team included the full ethics statement and established the foundational table structure to systematically organize team roles and contributions."
+        "Took the code from AI and replaced the conclusion text ('Why it matters' and the analysis text) with our own analysis results, then revised the wording. Starting from the first draft, tried different tabs, control panels and option types, and merged or removed secondary visualizations. Tried several visualization designs to improve readability."
       ),
       check.names = FALSE
     )
