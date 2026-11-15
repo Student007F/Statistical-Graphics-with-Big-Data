@@ -633,11 +633,11 @@ lyrics_year_change_notes <- function(yearly, column, measure_label) {
   } else {
     unique(as.character(yearly$series))
   }
-
+  
   cards <- lapply(series_names, function(group_name) {
     rows <- yearly[as.character(yearly$series) == group_name, , drop = FALSE]
     rows <- rows[order(rows$year), , drop = FALSE]
-
+    
     if (nrow(rows) < 2L) {
       return(div(
         class = "d1-change-card",
@@ -646,13 +646,13 @@ lyrics_year_change_notes <- function(yearly, column, measure_label) {
             "Only one year is available for the current selection.")
       ))
     }
-
+    
     first <- rows[[column]][1]
     last <- rows[[column]][nrow(rows)]
     change <- last - first
     direction <- if (abs(change) < 0.05) "flat" else if (change > 0) "up" else "down"
     arrow <- c(up = "▲", down = "▼", flat = "■")[[direction]]
-
+    
     div(
       class = "d1-change-card",
       div(class = "d1-change-series", group_name),
@@ -786,6 +786,25 @@ ui <- page_navbar(
     .bslib-card { margin-bottom: 12px; }
     .shiny-image-output img { object-fit: contain; }
     .shoe-caption { color: #576574; font-size: 0.93rem; }
+    /* Data 1: the control panel stays visible while the page scrolls. */
+    .d1-layout {
+      display: grid;
+      grid-template-columns: 320px minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
+    .d1-controls {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      max-height: calc(100dvh - 120px);
+      overflow-y: auto;
+      margin-bottom: 0;
+    }
+    @media (max-width: 991px) {
+      .d1-layout { grid-template-columns: 1fr; }
+      .d1-controls { position: static; max-height: none; }
+    }
     .d1-main-content { min-width: 0; width: 100%; }
     .d1-main-content .card { margin-bottom: 16px; }
     .d1-stat-grid {
@@ -1045,18 +1064,19 @@ ui <- page_navbar(
   nav_panel(
     "Data 1",
     scroll_tab(
-      layout_sidebar(
-        fill = FALSE, fillable = FALSE,
-        sidebar = sidebar(
-          title = "Data 1 Controls", width = 320,
+      div(
+        class = "d1-layout",
+        div(
+          class = "d1-controls card card-body",
+          h5("Data 1 Controls"),
           radioButtons(
             "d1_view", "Select Analysis",
-            choices = c("Finding A", "Finding B"),
-            selected = "Finding A"
+            choices = c("Analysis 1", "Analysis 2"),
+            selected = "Analysis 1"
           ),
           hr(),
           conditionalPanel(
-            "input.d1_view == 'Finding A'",
+            "input.d1_view == 'Analysis 1'",
             sliderInput(
               "year_range", "Select Year Range",
               min = lyrics_first_year, max = lyrics_last_year,
@@ -1082,24 +1102,24 @@ ui <- page_navbar(
               "A song with an unknown HYBE affiliation is excluded when comparing groups.")
           ),
           conditionalPanel(
-            "input.d1_view == 'Finding B'",
+            "input.d1_view == 'Analysis 2'",
             sliderInput(
               "c_thr", "Minimum English Share",
               min = 10, max = 90, value = 50, step = 5, post = "%"
             ),
             checkboxInput("c_hive", "Split by HYBE / Non-HYBE", FALSE),
             p(class = "shoe-caption",
-              "Finding B always uses the main counting rule and all available years.")
+              "Analysis 2 always uses the main counting rule and all available years.")
           )
         ),
         div(
           class = "d1-main-content",
           conditionalPanel(
-            "input.d1_view == 'Finding A'",
+            "input.d1_view == 'Analysis 1'",
             if (is.null(lyrics_data)) lyrics_unavailable_card() else tagList(
               card(
-                card_header("Finding A | English in K-pop lyrics over time"),
-                p("How has the proportion of English words in K-pop lyrics changed across years?"),
+                card_header("Analysis 1 | English in K-pop lyrics over time"),
+                p("How has the proportion of English words in charted K-pop lyrics changed across years?"),
                 tags$details(
                   class = "d1-method-details",
                   tags$summary("How are English percentages calculated?"),
@@ -1143,12 +1163,29 @@ ui <- page_navbar(
                 card_header("Observed Results for Selected Filters"),
                 uiOutput("a_observation"),
                 p(class = "shoe-caption",
-                  "These comparisons use only the first and last available year in each selected series; they do not establish a continuous trend or causation.")
+                  "These comparisons use only the first and last available year in each selected series; they do not establish a continuous trend or causation. When HYBE is shown separately, note that HYBE-affiliated songs appear only from 2016 (one song that year), so its change compares a very small first year with a later year and covers a different period than Non-HYBE.")
               ),
               card(
                 card_header("Why It Matters and Next Analysis"),
-                p(strong("Why it matters: "), "Comparing counting rules can show how fillers and repeated words affect the measured English share. This dataset describes lyric composition, not whether English lyrics cause greater popularity."),
-                p(strong("How this helps our next analysis: "), "Compare the selected series before deciding whether their patterns differ. Follow up by checking the role of repetition and ad-libs, and use a separate dataset with chart performance metrics to investigate any association with popularity.")
+                
+                p(
+                  strong("Why it matters: "),
+                  "In these charted songs, the average English share rose from 12.2% in 2014 to 35.6% in 2025 (Main rule, all songs). The same rise appears under Sub 1 and Sub 2, so it is not just an effect of ad-libs or repeated words. This dataset describes lyric composition, not whether English lyrics cause greater popularity."
+                ),
+                
+                p(strong("How This Helps Our Next Analysis: ")),
+                
+                p(
+                  strong("1. Pin Down When the Change Happens"),
+                  br(),
+                  "The yearly average stays between 11% and 20% through 2022, then rises to 25.3% (2023), 34.0% (2024) and 35.6% (2025). We will use 2022-2025 as the window in which to compare other data, such as search interest or tourist arrivals."
+                ),
+                
+                p(
+                  strong("2. Test the HYBE-First Pattern"),
+                  br(),
+                  "In 2021, 4 of 7 HYBE songs (57.1%) were at least 50% English versus 8.7% of other songs; by 2025 the figures were 60.0% and 39.3%. HYBE has only 6-15 songs per year since 2018, so we will repeat this with each song counted once."
+                )
               ),
               conditionalPanel(
                 "input.a_show_b",
@@ -1158,17 +1195,17 @@ ui <- page_navbar(
                   uiOutput("hive_stats"),
                   plotOutput("hive_plot", height = "380px"),
                   p(class = "shoe-caption",
-                    "The selected year range and group in the sidebar determine which songs appear here (using the main counting rule). These are descriptive differences, not evidence of a causal effect.")
+                    "The selected year range and group in the control panel determine which songs appear here (using the main counting rule). These are descriptive differences, not evidence of a causal effect.")
                 )
               )
             )
           ),
           conditionalPanel(
-            "input.d1_view == 'Finding B'",
+            "input.d1_view == 'Analysis 2'",
             if (is.null(lyrics_data)) lyrics_unavailable_card() else tagList(
               card(
-                card_header("Finding B | How many songs are English-centered?"),
-                p("What proportion of K-pop songs reach or exceed a given minimum English lyric threshold across years?")
+                card_header("Analysis 2 | How many songs are English-centered?"),
+                p("What proportion of charted K-pop songs reach or exceed a given minimum English lyric threshold across years?")
               ),
               card(card_header("Summary Statistics"), uiOutput("c_stats")),
               card(
@@ -1181,12 +1218,12 @@ ui <- page_navbar(
                 card_header("Observed Results for Selected Threshold"),
                 uiOutput("c_observation"),
                 p(class = "shoe-caption",
-                  "The change compares the first and last available year for each displayed group; it does not establish a continuous trend or causation.")
+                  "The change compares the first and last available year for each displayed group; it does not establish a continuous trend or causation. When HYBE is shown separately, note that HYBE-affiliated songs appear only from 2016 (one song that year), so its change compares a very small first year with a later year and covers a different period than Non-HYBE.")
               ),
               card(
                 card_header("Why It Matters and Next Analysis"),
-                p(strong("Why it matters: "), "Average English share alone does not reveal how many sampled songs exceed a chosen threshold. The threshold-based percentage describes that proportion within the dataset, not all K-pop releases."),
-                p(strong("How this helps our next analysis: "), "Use the selected threshold and year-by-year results to identify releases worth investigating. If the comparison reveals differences between years or affiliation groups, follow up with suitable data on their target markets, release formats, or artists.")
+                p(strong("Why it matters: "), "At the 50% threshold, the share of English-centered songs rose from 12.0% in 2022 to 41.4% in 2025 (Main rule, all songs), so the rise in the average comes with a larger group of songs that are mostly English. Average English share alone does not reveal this, because it does not show how many sampled songs exceed a chosen threshold. The threshold-based percentage describes that proportion within the dataset, not all K-pop releases."),
+                p(strong("How this helps our next analysis: "), "The share of songs with at least 50% English rose from 12.0% in 2022 to 41.4% in 2025. In a later project, we plan to bring in other data, such as search interest or tourist arrivals, and check whether they change during the same 2022-2025 period. We would also add artist information, such as group or solo, to describe which artists make these English-centered songs.")
               )
             )
           )
@@ -1201,7 +1238,7 @@ ui <- page_navbar(
       card(
         card_header("Ethics Statement"),
         p("We understand the rules on data and AI use for this project, including following the license and privacy rules of every dataset we used, understanding all of our code, and knowing that presenting AI output as our own work may be academic misconduct. We certify that we have followed all of them. Any violation is our responsibility, and we agree to receive an F in this course if we have not."),
-        p(strong("Signed: 박선우, 송현정, 한우영, 신유진, Flo"))
+        p(strong("Signed: 박선우, 송현정, 한우영, 신유진, Florian Urthaler"))
       ),
       card(
         card_header("What AI Did and What the Team Did"),
@@ -1660,7 +1697,7 @@ server <- function(input, output, session) {
   a_long <- reactive({
     data <- lyrics_required()
     validate(need(length(input$a_rules) > 0L,
-                  "Select at least one counting rule in the sidebar."))
+                  "Select at least one counting rule in the control panel."))
     req(input$year_range)
     data <- data[data$year >= input$year_range[1] &
                    data$year <= input$year_range[2], , drop = FALSE]
@@ -1820,16 +1857,16 @@ server <- function(input, output, session) {
         "Data 1"
       ),
       `What AI Did` = c(
-        "Combined catalogue search, caching, image conversion, and result display.",
-        "Combined PCA explanation plots, reconstruction, and leave-one-out evaluation.",
-        "Implemented personal shoe loading, gallery display, and prediction summaries.",
-        "Integrated K-pop Finding A/B charts, responsive filters, and descriptive result cards."
+        "Drafted the initial algorithm code to calculate Euclidean distances between image data and extract the top 5 closest matching shoes. It also suggested a foundational Shiny server template to display search results dynamically based on user inputs.",
+        "Provided standard code examples for performing principal component analysis (PCA) and extracting scores using built-in R functions. It also generated basic layout code to arrange the 6-step visualization graphs, from the average shoe to reconstructed images, onto a single screen.",
+        "Generated the initial code for loading personal shoe photos from the directory and converting them into grayscale matrices. It also provided layout templates to display the team's shoe gallery alongside their predicted categories and similarity scores.",
+        "AI assisted in modifying and debugging R code for the K-pop lyrics analysis. It helped create visualizations for Analysis 1 and Analysis 2 and organize the analysis results. It also provided suggestions for rearranging outputs, and helped write the code whenever we tried several ways of visualizing the data and modified what appears on the Shiny screen, including its interactive features."
       ),
       `What the Team Did` = c(
-        "'SHOE SEARCH' ",
-        "'EXPLAIN PCA' ",
-        "'OUR SHOES' ",
-        "'DATA 1' "
+        "The team collaboratively designed the overall app framework and revised the core code. In the 'Shoe Search' tab, we linked 2,000 shoe images with metadata to build and validate the Top 5 similarity search and category prediction logic using Euclidean distance.",
+        "The team structured the 6-step PCA visualization layout ranging from the average shoe and eigenshoes to reconstructed images across K values, directly resolving the matrix orientation issues in the 'image()'funtion to improve the visual output.",
+        "The team collected personal shoe images, standardized inconsistent file naming formats to prevent loading errors, and organized the folder structure. We also manually verified that each uploaded photo was properly resized, processed, and matched with accurate category predictions.",
+        "Took the code from AI and replaced the conclusion text ('Why it matters' and the analysis text) with our own analysis results, then revised the wording. Starting from the first draft, tried different tabs, control panels and option types, and merged or removed secondary visualizations. Tried several visualization designs to improve readability."
       ),
       check.names = FALSE
     )
@@ -1847,9 +1884,9 @@ server <- function(input, output, session) {
       Reflection = c(
         "My main responsibility in this project was refining and improving the code for the Shoes app. I also created a graph which shows an accuracy for different numbers of PCs, added extra features to the app interface to make it easier to navigate.
 \n During this project, I used AI by describing the changes I wanted to make and having it implement those changes directly in the code. This approach was usually convenient but when errors occurred in the code modified by AI, it was sometimes difficult to identify their causes. Through this experience, I realized that even when using AI as a coding assistant, it is still important to understand the underlying code.",
-        "송현정",
-        "한우영",
-        "신유진",
+        "Using AI in this project saved me a lot of time because I did not have to manually type out repetitive UI layouts or basic matrix operation code. However, when real data issues came up, such as image loading failures caused by inconsistent file names or errors from outdated syntax, AI could not fix them properly. In the end, I realized that simply copying code from AI is not enough, and that understanding the code flow and checking for errors myself is much more important.",
+        "My work focused on analyzing our K-pop lyrics dataset through Analysis 1 and Analysis 2, which explored changes in English lyric usage over time and the proportion of English-centered songs. During development, I found it challenging to rearrange the two analyses and organize the results in a way that clearly communicated our findings. I also had to decide which graphs were actually relevant to our conclusions and remove those that did not add meaningful information. AI helped me modify R code and resolve errors along the way, but the process taught me that creating a good analysis involves more than just generating graphs. I gained a better understanding of how to select, organize, and present data effectively, while also improving my skills in R and Shiny.",
+        "During this project, I mainly worked on the K-pop lyrics analysis in the Data 1 tab. When I classified songs by HYBE, no songs were counted for 2014-2015, which made me question whether the classification was missing something. After checking, I found that no HYBE-affiliated songs appeared in the chart data for those years, so it did not affect our results. I moved from a single simple graph to a version with counting-rule and HYBE options, and spent a lot of time on Shiny readability, changing the layout several times, because delivering an analysis effectively matters as much as the analysis itself.\n\nUnlike in my earlier Python projects, AI could not run R code, so I had to run it and fix errors myself, especially file-not-found errors caused by files in the wrong folders. I learned that even as AI makes writing code easier, running, debugging, and refining it ourselves is still essential, because the feedback is what matters.",
         "During this project, I mainly focused on combining our team's code, improving usability, and organizing the application. I worked on creating a consistent interface, improving navigation, cleaning up the folder structure, and testing the different functions.
         \n I used AI to help merge code, improve the R Shiny layout, remove unnecessary code, and fix errors. However, AI-generated solutions did not always work correctly and needed testing and adjustments. I learned that AI is a useful tool for speeding up development, but understanding and verifying the code remains important."
       ),
