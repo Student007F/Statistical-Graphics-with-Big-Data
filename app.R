@@ -1839,16 +1839,16 @@ server <- function(input, output, session) {
         "Data 1"
       ),
       `What AI Did` = c(
-        "Combined catalogue search, caching, image conversion, and result display.",
-        "Combined PCA explanation plots, reconstruction, and leave-one-out evaluation.",
-        "Implemented personal shoe loading, gallery display, and prediction summaries.",
-        "Integrated K-pop Analysis 1/2 charts, responsive filters, and descriptive result cards."
-      ),
-      `What the Team Did` = c(
         "Drafted the initial algorithm code to calculate Euclidean distances between image data and extract the top 5 closest matching shoes. It also suggested a foundational Shiny server template to display search results dynamically based on user inputs.",
         "Provided standard code examples for performing principal component analysis (PCA) and extracting scores using built-in R functions. It also generated basic layout code to arrange the 6-step visualization graphs, from the average shoe to reconstructed images, onto a single screen.",
+        "Implemented personal shoe loading, gallery display, and prediction summaries.",
+        "Guided the use of a Shiny UI function (tags$blockquote) to neatly display the ethics statement as a quote block on the screen. It also drafted the basic data frame and table output code to present team roles and reflections in an organized table format."
+      ),
+      `What the Team Did` = c(
+        "The team collaboratively designed the overall app framework and implemented the core code. In the 'Shoe Search' tab, we linked 2,000 shoe images with metadata to build and validate the Top 5 similarity search and category prediction logic using Euclidean distance.",
+        "The team structured the 6-step PCA visualization layout ranging from the average shoe and eigenshoes to reconstructed images across K values, directly resolving the matrix orientation issues in the 'image()'funtion to improve the visual output.",
         "Guided the use of a Shiny UI function (tags$blockquote) to neatly display the ethics statement as a quote block on the screen. It also drafted the basic data frame and table output code to present team roles and reflections in an organized table format.",
-        "Assisted in writing R code for preprocessing and analyzing K-pop lyrics data. Implemented interactive filters for selecting year ranges and English word-counting methods (Main, Sub 1, and Sub 2) to compare English lyric proportions over time. Also developed code to compare English usage between HYBE and Non-HYBE artists. Additionally, supported the implementation of a threshold-based analysis to calculate the yearly proportion of English-centered songs, along with dynamic summary statistics and visualizations using Shiny UI and server functions."
+        "The team included the full ethics statement and established the foundational table structure to systematically organize team roles and contributions."
       ),
       check.names = FALSE
     )
