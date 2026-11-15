@@ -43,6 +43,7 @@ TEMP_DIR <- file.path("generated", "temp")
 CATALOGUE_CSV <- file.path(DATA_DIR, "shoes_meta.csv")
 SELFCHECK_LABEL_CSV <- file.path(DATA_DIR, "selfcheck_labels.csv")
 CACHE_FILE <- file.path(CACHE_DIR, "pca_cache_unified_v2.rds")
+ACCURACY_CACHE_FILE <- file.path(CACHE_DIR, "loo_accuracy.rds")
 
 # The project already uses data/shoes/ and data/ourshoes/.
 # Only folders containing generated files need to be created at startup.
@@ -221,13 +222,15 @@ read_selfcheck_label <- function(filename) {
 
 # 5. PCA WITH A VERSIONED, VALIDATED CACHE --------------------
 # Changing the processing algorithm or source files invalidates the cache.
-info <- file.info(catalogue_paths)
+# File timestamps change during deployment, even when images do not.
+# Content hashes allow the locally generated PCA cache to be reused in the cloud.
+image_hashes <- unname(tools::md5sum(catalogue_paths))
+if (anyNA(image_hashes)) stop("Could not checksum all catalogue images.")
 cache_manifest <- list(
   version = CACHE_VERSION,
   ids = shoes_meta$id,
   categories = shoes_meta$category,
-  sizes = as.numeric(info$size),
-  modified = as.numeric(info$mtime)
+  hashes = image_hashes
 )
 
 cached <- if (file.exists(CACHE_FILE)) {
@@ -236,7 +239,7 @@ cached <- if (file.exists(CACHE_FILE)) {
   NULL
 }
 
-cache_ok <- is.list(cached) && identical(cached$manifest, cache_manifest) &&
+cache_structure_ok <- is.list(cached) &&
   is.matrix(cached$X) && nrow(cached$X) == nrow(shoes_meta) &&
   ncol(cached$X) == PIXEL_COUNT &&
   is.matrix(cached$loadings) && is.matrix(cached$scores) &&
@@ -244,9 +247,22 @@ cache_ok <- is.list(cached) && identical(cached$manifest, cache_manifest) &&
   nrow(cached$scores) == nrow(shoes_meta) &&
   ncol(cached$scores) == ncol(cached$loadings) &&
   length(cached$var_explained) == ncol(cached$loadings)
+cache_ok <- cache_structure_ok && identical(cached$manifest, cache_manifest)
 
-# Spot-check actual pixels even when the cache metadata appears unchanged.
-# This catches a cache built with a different pixel order or decoder.
+# Upgrade older timestamp-based caches without recalculating the SVD.
+# Verify EVERY catalogue image once before trusting the older cache format.
+if (cache_structure_ok && !cache_ok && is.null(cached$manifest$hashes) &&
+    identical(cached$manifest$version, CACHE_VERSION) &&
+    identical(cached$manifest$ids, shoes_meta$id) &&
+    identical(cached$manifest$categories, shoes_meta$category) &&
+    identical(cached$manifest$sizes, as.numeric(file.info(catalogue_paths)$size))) {
+  message("Verifying older PCA cache against all catalogue images...")
+  cache_ok <- all(vapply(seq_along(catalogue_paths), function(i) {
+    identical(as.numeric(cached$X[i, ]), read_png_vector(catalogue_paths[i]))
+  }, logical(1)))
+}
+
+# Keep a pixel-order check even for caches with matching file hashes.
 if (cache_ok) {
   probes <- unique(c(1L, ceiling(nrow(shoes_meta) / 2), nrow(shoes_meta)))
   cache_ok <- all(vapply(probes, function(i) {
@@ -257,6 +273,13 @@ if (cache_ok) {
 if (cache_ok) {
   message("Loading validated PCA cache: ", CACHE_FILE)
   pca_data <- cached
+  # 8-bit image pixels fit in integer storage (4 instead of 8 bytes/pixel).
+  if (typeof(pca_data$X) != "integer") storage.mode(pca_data$X) <- "integer"
+  if (!identical(pca_data$manifest, cache_manifest)) {
+    pca_data$manifest <- cache_manifest
+    tryCatch(saveRDS(pca_data, CACHE_FILE),
+             error = function(e) warning("Could not upgrade PCA cache: ", conditionMessage(e)))
+  }
 } else {
   message("Building PCA catalogue from ", nrow(shoes_meta), " images...")
   X <- t(vapply(catalogue_paths, read_png_vector, numeric(PIXEL_COUNT)))
@@ -270,6 +293,7 @@ if (cache_ok) {
   scores <- centered %*% loadings
   explained <- 100 * decomposition$d[seq_len(components)]^2 /
     sum(decomposition$d^2)
+  storage.mode(X) <- "integer"  # Halve the memory used by the stored pixel matrix.
   
   pca_data <- list(
     manifest = cache_manifest,
@@ -377,6 +401,19 @@ compute_loo_accuracy <- function(progress_callback = function(k) NULL) {
     return(get("results", envir = accuracy_cache, inherits = FALSE))
   }
   
+  # Load accuracy precomputed locally, so cloud sessions can avoid heavy work.
+  saved <- if (file.exists(ACCURACY_CACHE_FILE)) {
+    tryCatch(readRDS(ACCURACY_CACHE_FILE), error = function(e) NULL)
+  } else NULL
+  if (is.list(saved) && identical(saved$manifest, cache_manifest) &&
+      identical(saved$categories, category_levels) &&
+      is.list(saved$result) && length(saved$result$K) == K_MAX &&
+      length(saved$result$overall) == K_MAX &&
+      identical(colnames(saved$result$by_cat), category_levels)) {
+    assign("results", saved$result, envir = accuracy_cache)
+    return(saved$result)
+  }
+  
   S <- pca_data$scores
   n <- nrow(S)
   truth_factor <- factor(shoes_meta$category, levels = category_levels)
@@ -389,9 +426,16 @@ compute_loo_accuracy <- function(progress_callback = function(k) NULL) {
     dimnames = list(NULL, category_levels)
   )
   
+  diag(D2) <- Inf
   for (k in seq_len(K_MAX)) {
-    D2 <- D2 + outer(S[, k], S[, k], "-")^2
-    diag(D2) <- Inf
+    # Update distances in small blocks instead of creating several 2000x2000
+    # temporary matrices for every principal component.
+    scores_k <- S[, k]
+    for (start in seq.int(1L, n, by = 256L)) {
+      rows <- seq.int(start, min(start + 255L, n))
+      D2[rows, ] <- D2[rows, ] +
+        outer(scores_k[rows], scores_k, FUN = function(a, b) (a - b)^2)
+    }
     
     neighbor_rows <- t(vapply(seq_len(n), function(i) {
       row_distances <- D2[i, ]
@@ -417,6 +461,10 @@ compute_loo_accuracy <- function(progress_callback = function(k) NULL) {
   
   result <- list(K = seq_len(K_MAX), overall = overall, by_cat = by_category)
   assign("results", result, envir = accuracy_cache)
+  tryCatch(saveRDS(list(manifest = cache_manifest,
+                        categories = category_levels, result = result),
+                   ACCURACY_CACHE_FILE),
+           error = function(e) warning("Could not save accuracy cache: ", conditionMessage(e)))
   result
 }
 
@@ -1383,8 +1431,18 @@ server <- function(input, output, session) {
     req(input$photo)
     region <- upload_crop()
     vector <- if (is.null(region)) {
-      tryCatch(read_external_vector(input$photo$datapath),
-               error = function(e) NULL)
+      tryCatch({
+        working <- upload_image()  # Already oriented and limited to 1000 px.
+        info <- magick::image_info(working)
+        if (tolower(info$format[1]) == "png" &&
+            info$width[1] == IMAGE_SIDE && info$height[1] == IMAGE_SIDE) {
+          exact <- tryCatch(read_png_vector(input$photo$datapath),
+                            error = function(e) NULL)
+          if (!is.null(exact)) exact else image_to_vector(working)
+        } else {
+          image_to_vector(working)
+        }
+      }, error = function(e) NULL)
     } else {
       tryCatch(
         image_to_vector(magick::image_crop(upload_image(), region$geometry)),
