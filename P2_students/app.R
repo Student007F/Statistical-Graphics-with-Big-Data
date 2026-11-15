@@ -31,6 +31,10 @@ CACHE_VERSION <- "column-major-png-grayscale-v2"
 CROP_WORKING_SIDE <- 1000L
 MIN_CROP_SIDE <- 8L
 
+# Expensive PCA/accuracy calculations are opt-in and must run locally.
+# Deploy the finished cache files; never build them in the cloud runtime.
+LOCAL_CACHE_BUILD <- identical(Sys.getenv("CHIPMUNK_BUILD_CACHE"), "1")
+
 # 2. PROJECT FOLDERS -----------------------------------------
 # Catalogue and personal shoe images live inside data/ alongside CSV files.
 # Self-check images stay in selfcheck/; generated files stay in generated/.
@@ -270,31 +274,58 @@ if (cache_ok) {
   }, logical(1)))
 }
 
+# The deployed app must not recalculate a full 2,000 x 4,096 PCA.
+# An invalid or missing cache is a deployment error, not a reason to run SVD.
+message("[Chipmunk] PCA cache present: ", file.exists(CACHE_FILE),
+        "; valid: ", cache_ok,
+        "; local build enabled: ", LOCAL_CACHE_BUILD)
+if (!cache_ok && !LOCAL_CACHE_BUILD) {
+  stop(
+    "PCA cache is missing or does not match the catalogue: ", CACHE_FILE, "\n",
+    "The cloud app will NOT calculate PCA (to avoid out-of-memory crashes).\n",
+    "On your own computer run: source('build_cache.R')\n",
+    "Then publish BOTH generated/cache/*.rds files with app.R and data/.\n",
+    "If using GitHub, ensure the .rds files are committed, not ignored."
+  )
+}
+
 if (cache_ok) {
   message("Loading validated PCA cache: ", CACHE_FILE)
   pca_data <- cached
-  # 8-bit image pixels fit in integer storage (4 instead of 8 bytes/pixel).
-  if (typeof(pca_data$X) != "integer") storage.mode(pca_data$X) <- "integer"
-  if (!identical(pca_data$manifest, cache_manifest)) {
-    pca_data$manifest <- cache_manifest
-    tryCatch(saveRDS(pca_data, CACHE_FILE),
-             error = function(e) warning("Could not upgrade PCA cache: ", conditionMessage(e)))
+  # Each pixel is an integer 0..255, so a raw matrix needs just one byte.
+  # Every caller converts selected pixels to numeric before arithmetic.
+  compact_pixels <- typeof(pca_data$X) != "raw"
+  upgrade_manifest <- !identical(pca_data$manifest, cache_manifest)
+  if (compact_pixels) {
+    old_dims <- dim(pca_data$X)
+    pca_data$X <- matrix(as.raw(pca_data$X), nrow = old_dims[1], ncol = old_dims[2])
   }
+  if (upgrade_manifest) pca_data$manifest <- cache_manifest
+  # Only rewrite a cache during the explicit local build, never on the server.
+  if (LOCAL_CACHE_BUILD && (compact_pixels || upgrade_manifest)) {
+    tryCatch(saveRDS(pca_data, CACHE_FILE),
+             error = function(e) warning("Could not update PCA cache: ", conditionMessage(e)))
+  }
+  rm(cached)
 } else {
-  message("Building PCA catalogue from ", nrow(shoes_meta), " images...")
+  # Only reached through build_cache.R on a machine with sufficient RAM.
+  rm(cached)
+  invisible(gc(verbose = FALSE))
+  message("Building PCA catalogue LOCALLY from ", nrow(shoes_meta), " images...")
   X <- t(vapply(catalogue_paths, read_png_vector, numeric(PIXEL_COUNT)))
   x_bar <- colMeans(X)
   centered <- sweep(X, 2, x_bar, "-")
   components <- min(MAX_PCS, nrow(X) - 1L, ncol(X))
-  
+
   # PCA without variance scaling: brightness/shape variation is preserved.
   decomposition <- svd(centered, nu = 0L, nv = components)
   loadings <- decomposition$v[, seq_len(components), drop = FALSE]
   scores <- centered %*% loadings
   explained <- 100 * decomposition$d[seq_len(components)]^2 /
     sum(decomposition$d^2)
-  storage.mode(X) <- "integer"  # Halve the memory used by the stored pixel matrix.
-  
+  old_dims <- dim(X)
+  X <- matrix(as.raw(X), nrow = old_dims[1], ncol = old_dims[2])
+
   pca_data <- list(
     manifest = cache_manifest,
     X = X,
@@ -400,7 +431,7 @@ compute_loo_accuracy <- function(progress_callback = function(k) NULL) {
   if (exists("results", envir = accuracy_cache, inherits = FALSE)) {
     return(get("results", envir = accuracy_cache, inherits = FALSE))
   }
-  
+
   # Load accuracy precomputed locally, so cloud sessions can avoid heavy work.
   saved <- if (file.exists(ACCURACY_CACHE_FILE)) {
     tryCatch(readRDS(ACCURACY_CACHE_FILE), error = function(e) NULL)
@@ -413,7 +444,14 @@ compute_loo_accuracy <- function(progress_callback = function(k) NULL) {
     assign("results", saved$result, envir = accuracy_cache)
     return(saved$result)
   }
-  
+
+  # Do not run this expensive calculation on the cloud server.
+  # Run build_cache.R locally to create generated/cache/loo_accuracy.rds.
+  if (!LOCAL_CACHE_BUILD) {
+    shiny::validate(shiny::need(FALSE,
+      "Precomputed accuracy results are missing or outdated. Run source('build_cache.R') locally and redeploy generated/cache/loo_accuracy.rds."))
+  }
+
   S <- pca_data$scores
   n <- nrow(S)
   truth_factor <- factor(shoes_meta$category, levels = category_levels)
