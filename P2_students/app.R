@@ -31,10 +31,6 @@ CACHE_VERSION <- "column-major-png-grayscale-v2"
 CROP_WORKING_SIDE <- 1000L
 MIN_CROP_SIDE <- 8L
 
-# Expensive PCA/accuracy calculations are opt-in and must run locally.
-# Deploy the finished cache files; never build them in the cloud runtime.
-LOCAL_CACHE_BUILD <- identical(Sys.getenv("CHIPMUNK_BUILD_CACHE"), "1")
-
 # 2. PROJECT FOLDERS -----------------------------------------
 # Catalogue and personal shoe images live inside data/ alongside CSV files.
 # Self-check images stay in selfcheck/; generated files stay in generated/.
@@ -47,7 +43,6 @@ TEMP_DIR <- file.path("generated", "temp")
 CATALOGUE_CSV <- file.path(DATA_DIR, "shoes_meta.csv")
 SELFCHECK_LABEL_CSV <- file.path(DATA_DIR, "selfcheck_labels.csv")
 CACHE_FILE <- file.path(CACHE_DIR, "pca_cache_unified_v2.rds")
-ACCURACY_CACHE_FILE <- file.path(CACHE_DIR, "loo_accuracy.rds")
 
 # The project already uses data/shoes/ and data/ourshoes/.
 # Only folders containing generated files need to be created at startup.
@@ -226,15 +221,15 @@ read_selfcheck_label <- function(filename) {
 
 # 5. PCA WITH A VERSIONED, VALIDATED CACHE --------------------
 # Changing the processing algorithm or source files invalidates the cache.
-# File timestamps change during deployment, even when images do not.
-# Content hashes allow the locally generated PCA cache to be reused in the cloud.
-image_hashes <- unname(tools::md5sum(catalogue_paths))
-if (anyNA(image_hashes)) stop("Could not checksum all catalogue images.")
+# File modification times are deliberately NOT used: uploading the project to
+# GitHub or Posit Cloud changes them, which would make a valid cache look
+# outdated. File sizes plus the pixel spot-check below detect real changes.
+info <- file.info(catalogue_paths)
 cache_manifest <- list(
   version = CACHE_VERSION,
   ids = shoes_meta$id,
   categories = shoes_meta$category,
-  hashes = image_hashes
+  sizes = as.numeric(info$size)
 )
 
 cached <- if (file.exists(CACHE_FILE)) {
@@ -243,7 +238,7 @@ cached <- if (file.exists(CACHE_FILE)) {
   NULL
 }
 
-cache_structure_ok <- is.list(cached) &&
+cache_ok <- is.list(cached) && identical(cached$manifest, cache_manifest) &&
   is.matrix(cached$X) && nrow(cached$X) == nrow(shoes_meta) &&
   ncol(cached$X) == PIXEL_COUNT &&
   is.matrix(cached$loadings) && is.matrix(cached$scores) &&
@@ -251,22 +246,9 @@ cache_structure_ok <- is.list(cached) &&
   nrow(cached$scores) == nrow(shoes_meta) &&
   ncol(cached$scores) == ncol(cached$loadings) &&
   length(cached$var_explained) == ncol(cached$loadings)
-cache_ok <- cache_structure_ok && identical(cached$manifest, cache_manifest)
 
-# Upgrade older timestamp-based caches without recalculating the SVD.
-# Verify EVERY catalogue image once before trusting the older cache format.
-if (cache_structure_ok && !cache_ok && is.null(cached$manifest$hashes) &&
-    identical(cached$manifest$version, CACHE_VERSION) &&
-    identical(cached$manifest$ids, shoes_meta$id) &&
-    identical(cached$manifest$categories, shoes_meta$category) &&
-    identical(cached$manifest$sizes, as.numeric(file.info(catalogue_paths)$size))) {
-  message("Verifying older PCA cache against all catalogue images...")
-  cache_ok <- all(vapply(seq_along(catalogue_paths), function(i) {
-    identical(as.numeric(cached$X[i, ]), read_png_vector(catalogue_paths[i]))
-  }, logical(1)))
-}
-
-# Keep a pixel-order check even for caches with matching file hashes.
+# Spot-check actual pixels even when the cache metadata appears unchanged.
+# This catches a cache built with a different pixel order or decoder.
 if (cache_ok) {
   probes <- unique(c(1L, ceiling(nrow(shoes_meta) / 2), nrow(shoes_meta)))
   cache_ok <- all(vapply(probes, function(i) {
@@ -274,58 +256,23 @@ if (cache_ok) {
   }, logical(1)))
 }
 
-# The deployed app must not recalculate a full 2,000 x 4,096 PCA.
-# An invalid or missing cache is a deployment error, not a reason to run SVD.
-message("[Chipmunk] PCA cache present: ", file.exists(CACHE_FILE),
-        "; valid: ", cache_ok,
-        "; local build enabled: ", LOCAL_CACHE_BUILD)
-if (!cache_ok && !LOCAL_CACHE_BUILD) {
-  stop(
-    "PCA cache is missing or does not match the catalogue: ", CACHE_FILE, "\n",
-    "The cloud app will NOT calculate PCA (to avoid out-of-memory crashes).\n",
-    "On your own computer run: source('build_cache.R')\n",
-    "Then publish BOTH generated/cache/*.rds files with app.R and data/.\n",
-    "If using GitHub, ensure the .rds files are committed, not ignored."
-  )
-}
-
 if (cache_ok) {
   message("Loading validated PCA cache: ", CACHE_FILE)
   pca_data <- cached
-  # Each pixel is an integer 0..255, so a raw matrix needs just one byte.
-  # Every caller converts selected pixels to numeric before arithmetic.
-  compact_pixels <- typeof(pca_data$X) != "raw"
-  upgrade_manifest <- !identical(pca_data$manifest, cache_manifest)
-  if (compact_pixels) {
-    old_dims <- dim(pca_data$X)
-    pca_data$X <- matrix(as.raw(pca_data$X), nrow = old_dims[1], ncol = old_dims[2])
-  }
-  if (upgrade_manifest) pca_data$manifest <- cache_manifest
-  # Only rewrite a cache during the explicit local build, never on the server.
-  if (LOCAL_CACHE_BUILD && (compact_pixels || upgrade_manifest)) {
-    tryCatch(saveRDS(pca_data, CACHE_FILE),
-             error = function(e) warning("Could not update PCA cache: ", conditionMessage(e)))
-  }
-  rm(cached)
 } else {
-  # Only reached through build_cache.R on a machine with sufficient RAM.
-  rm(cached)
-  invisible(gc(verbose = FALSE))
-  message("Building PCA catalogue LOCALLY from ", nrow(shoes_meta), " images...")
+  message("Building PCA catalogue from ", nrow(shoes_meta), " images...")
   X <- t(vapply(catalogue_paths, read_png_vector, numeric(PIXEL_COUNT)))
   x_bar <- colMeans(X)
   centered <- sweep(X, 2, x_bar, "-")
   components <- min(MAX_PCS, nrow(X) - 1L, ncol(X))
-
+  
   # PCA without variance scaling: brightness/shape variation is preserved.
   decomposition <- svd(centered, nu = 0L, nv = components)
   loadings <- decomposition$v[, seq_len(components), drop = FALSE]
   scores <- centered %*% loadings
   explained <- 100 * decomposition$d[seq_len(components)]^2 /
     sum(decomposition$d^2)
-  old_dims <- dim(X)
-  X <- matrix(as.raw(X), nrow = old_dims[1], ncol = old_dims[2])
-
+  
   pca_data <- list(
     manifest = cache_manifest,
     X = X,
@@ -426,32 +373,45 @@ plot_neighbor_gallery <- function(top5) {
 # Optional, expensive computation: leave one catalogue image out, then
 # classify it using its five closest remaining neighbours at each K
 # within the precomputed PCA coordinate space.
+#
+# The result is saved to generated/cache/loo_accuracy.rds. Compute it once on
+# your own computer (run the app and click the button), then upload the
+# generated/ folder with the app. The deployed app then loads the saved
+# result instantly instead of recomputing it on the server.
+LOO_FILE <- file.path(CACHE_DIR, "loo_accuracy.rds")
+loo_manifest <- list(
+  version = "loo-accuracy-v1",
+  catalogue = cache_manifest,
+  k_max = K_MAX,
+  neighbors = NEIGHBORS,
+  categories = category_levels
+)
+
 accuracy_cache <- new.env(parent = emptyenv())
+
+saved_loo <- if (file.exists(LOO_FILE)) {
+  tryCatch(readRDS(LOO_FILE), error = function(e) NULL)
+} else {
+  NULL
+}
+if (is.list(saved_loo) && identical(saved_loo$manifest, loo_manifest) &&
+    length(saved_loo$result$overall) == K_MAX) {
+  assign("results", saved_loo$result, envir = accuracy_cache)
+  message("Loaded precomputed leave-one-out accuracy: ", LOO_FILE)
+} else if (!is.null(saved_loo)) {
+  message("Saved leave-one-out accuracy does not match the catalogue; ignoring it.")
+}
+rm(saved_loo)
+
+has_precomputed_loo <- function() {
+  exists("results", envir = accuracy_cache, inherits = FALSE)
+}
+
 compute_loo_accuracy <- function(progress_callback = function(k) NULL) {
   if (exists("results", envir = accuracy_cache, inherits = FALSE)) {
     return(get("results", envir = accuracy_cache, inherits = FALSE))
   }
-
-  # Load accuracy precomputed locally, so cloud sessions can avoid heavy work.
-  saved <- if (file.exists(ACCURACY_CACHE_FILE)) {
-    tryCatch(readRDS(ACCURACY_CACHE_FILE), error = function(e) NULL)
-  } else NULL
-  if (is.list(saved) && identical(saved$manifest, cache_manifest) &&
-      identical(saved$categories, category_levels) &&
-      is.list(saved$result) && length(saved$result$K) == K_MAX &&
-      length(saved$result$overall) == K_MAX &&
-      identical(colnames(saved$result$by_cat), category_levels)) {
-    assign("results", saved$result, envir = accuracy_cache)
-    return(saved$result)
-  }
-
-  # Do not run this expensive calculation on the cloud server.
-  # Run build_cache.R locally to create generated/cache/loo_accuracy.rds.
-  if (!LOCAL_CACHE_BUILD) {
-    shiny::validate(shiny::need(FALSE,
-      "Precomputed accuracy results are missing or outdated. Run source('build_cache.R') locally and redeploy generated/cache/loo_accuracy.rds."))
-  }
-
+  
   S <- pca_data$scores
   n <- nrow(S)
   truth_factor <- factor(shoes_meta$category, levels = category_levels)
@@ -464,16 +424,9 @@ compute_loo_accuracy <- function(progress_callback = function(k) NULL) {
     dimnames = list(NULL, category_levels)
   )
   
-  diag(D2) <- Inf
   for (k in seq_len(K_MAX)) {
-    # Update distances in small blocks instead of creating several 2000x2000
-    # temporary matrices for every principal component.
-    scores_k <- S[, k]
-    for (start in seq.int(1L, n, by = 256L)) {
-      rows <- seq.int(start, min(start + 255L, n))
-      D2[rows, ] <- D2[rows, ] +
-        outer(scores_k[rows], scores_k, FUN = function(a, b) (a - b)^2)
-    }
+    D2 <- D2 + outer(S[, k], S[, k], "-")^2
+    diag(D2) <- Inf
     
     neighbor_rows <- t(vapply(seq_len(n), function(i) {
       row_distances <- D2[i, ]
@@ -499,10 +452,13 @@ compute_loo_accuracy <- function(progress_callback = function(k) NULL) {
   
   result <- list(K = seq_len(K_MAX), overall = overall, by_cat = by_category)
   assign("results", result, envir = accuracy_cache)
-  tryCatch(saveRDS(list(manifest = cache_manifest,
-                        categories = category_levels, result = result),
-                   ACCURACY_CACHE_FILE),
-           error = function(e) warning("Could not save accuracy cache: ", conditionMessage(e)))
+  # Save for later sessions and for deployment. A failed save is not fatal.
+  tryCatch({
+    saveRDS(list(manifest = loo_manifest, result = result), LOO_FILE)
+    message("Leave-one-out accuracy saved to ", LOO_FILE)
+  }, error = function(e) {
+    warning("Could not save leave-one-out accuracy: ", conditionMessage(e))
+  })
   result
 }
 
@@ -1469,18 +1425,8 @@ server <- function(input, output, session) {
     req(input$photo)
     region <- upload_crop()
     vector <- if (is.null(region)) {
-      tryCatch({
-        working <- upload_image()  # Already oriented and limited to 1000 px.
-        info <- magick::image_info(working)
-        if (tolower(info$format[1]) == "png" &&
-            info$width[1] == IMAGE_SIDE && info$height[1] == IMAGE_SIDE) {
-          exact <- tryCatch(read_png_vector(input$photo$datapath),
-                            error = function(e) NULL)
-          if (!is.null(exact)) exact else image_to_vector(working)
-        } else {
-          image_to_vector(working)
-        }
-      }, error = function(e) NULL)
+      tryCatch(read_external_vector(input$photo$datapath),
+               error = function(e) NULL)
     } else {
       tryCatch(
         image_to_vector(magick::image_crop(upload_image(), region$geometry)),
@@ -1609,18 +1555,23 @@ server <- function(input, output, session) {
     }
   })
   
+  # Precomputed results are shown immediately; otherwise wait for the button.
   accuracy_result <- eventReactive(input$run_acc, {
+    if (has_precomputed_loo()) {
+      return(get("results", envir = accuracy_cache, inherits = FALSE))
+    }
+    if (is.null(input$run_acc) || input$run_acc == 0) return(NULL)
     withProgress(message = "Computing leave-one-out accuracy", value = 0, {
       compute_loo_accuracy(function(k) {
         incProgress(1 / K_MAX, detail = paste("K =", k))
       })
     })
-  })
-  
+  }, ignoreNULL = FALSE)
+
   output$acc_plot <- renderPlot({
-    validate(need(input$run_acc > 0,
-                  "Click the button to calculate accuracy across K values."))
     result <- accuracy_result()
+    validate(need(!is.null(result),
+                  "Click the button to calculate accuracy across K values."))
     best_k <- which.max(result$overall)
     plot(
       result$K, 100 * result$overall, type = "l", lwd = 3,
@@ -1647,8 +1598,8 @@ server <- function(input, output, session) {
   })
   
   output$acc_text <- renderText({
-    req(input$run_acc > 0)
     result <- accuracy_result()
+    req(result)
     best_k <- which.max(result$overall)
     sprintf(
       "Selected K = %d: %.1f%% accuracy (%d of %d). Highest catalogue leave-one-out accuracy: %.1f%% at K = %d.",
@@ -1980,7 +1931,7 @@ server <- function(input, output, session) {
       Reflection = c(
         "My main responsibility in this project was refining and improving the code for the Shoes app. I also created a graph which shows an accuracy for different numbers of PCs, added extra features to the app interface to make it easier to navigate.
 \n During this project, I used AI by describing the changes I wanted to make and having it implement those changes directly in the code. This approach was usually convenient but when errors occurred in the code modified by AI, it was sometimes difficult to identify their causes. Through this experience, I realized that even when using AI as a coding assistant, it is still important to understand the underlying code.",
-        "Using AI in this project saved me a lot of time because I did not have to manually type out repetitive UI layouts or basic matrix operation code. However, when real data issues came up, such as image loading failures caused by inconsistent file names or errors from outdated syntax, AI could not fix them properly. In the end, I realized that simply copying code from AI is not enough, and that understanding the code flow and checking for errors myself is much more important.",
+        "My main responsibility in this project was refining and improving the overall code, particularly focusing on the Shoe Search tab. Within this tab, I added extra features to the app interface to make navigation much more intuitive for users and created a new graph that visualizes accuracy across different numbers of Principal Components (PCs). During this development process, I actively used AI by describing the changes I wanted to make and having it implement the code directly. While this approach was generally convenient for repetitive tasks, I faced significant challenges when errors occurred in the AI-modified code, as it was often difficult to trace down their exact causes and fix them. Through this hands-on experience, I realized that even when leveraging AI as a coding assistant, it is still crucial to thoroughly understand the underlying code and logic rather than relying blindly on generated outputs.",
         "My work focused on analyzing our K-pop lyrics dataset through Analysis 1 and Analysis 2, which explored changes in English lyric usage over time and the proportion of English-centered songs. During development, I found it challenging to rearrange the two analyses and organize the results in a way that clearly communicated our findings. I also had to decide which graphs were actually relevant to our conclusions and remove those that did not add meaningful information. AI helped me modify R code and resolve errors along the way, but the process taught me that creating a good analysis involves more than just generating graphs. I gained a better understanding of how to select, organize, and present data effectively, while also improving my skills in R and Shiny.",
         "During this project, I mainly worked on the K-pop lyrics analysis in the Data 1 tab. When I classified songs by HYBE, no songs were counted for 2014-2015, which made me question whether the classification was missing something. After checking, I found that no HYBE-affiliated songs appeared in the chart data for those years, so it did not affect our results. I moved from a single simple graph to a version with counting-rule and HYBE options, and spent a lot of time on Shiny readability, changing the layout several times, because delivering an analysis effectively matters as much as the analysis itself.\n\nUnlike in my earlier Python projects, AI could not run R code, so I had to run it and fix errors myself, especially file-not-found errors caused by files in the wrong folders. I learned that even as AI makes writing code easier, running, debugging, and refining it ourselves is still essential, because the feedback is what matters.",
         "During this project, I mainly focused on combining our team's code, improving usability, and organizing the application. I worked on creating a consistent interface, improving navigation, cleaning up the folder structure, and testing the different functions.
