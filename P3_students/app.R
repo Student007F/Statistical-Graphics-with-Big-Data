@@ -1,4 +1,4 @@
-# ============================================================.
+# ============================================================
 # CHIPMUNK - Project 3 (R Shiny)
 # ============================================================
 
@@ -306,6 +306,31 @@ ui <- page_navbar(
               card(card_header("Average Shoe"), plotOutput("average_shoe", height = "220px")),
               card(card_header("PCA Reconstruction"), plotOutput("reconstructed_shoe", height = "220px"))
             ),
+                        tags$details(
+              class = "d1-method-details",
+              tags$summary("What do these three images show?"),
+              p(strong("How the app sees a shoe: "),
+                "Selected − Average = how this shoe differs from a typical shoe → that difference is compressed into K numbers (PC scores) → Average + those K numbers = Reconstruction."),
+              tags$ol(
+                tags$li(strong("Selected − Average: "),
+                        "Subtracting the Average Shoe from the Selected Shoe leaves only what makes this shoe different from a typical shoe, for example a higher ankle or a darker sole."),
+                tags$li(strong("Compressed into K numbers: "),
+                        "From the whole catalogue, PCA has learned the most common patterns of difference between shoes (the principal components). Each PC score says how strongly one of these patterns appears in this shoe, so K numbers replace 4,096 pixels."),
+                tags$li(strong("Average + those K numbers: "),
+                        "Starting from the Average Shoe and adding each pattern in the amount given by its score rebuilds the shoe. The closer the Reconstruction looks to the original, the better the K numbers describe the shoe.")
+              ),
+              div(
+                class = "d1-method-grid",
+                div(strong("Selected Shoe"),
+                    p("The chosen catalogue photo, stored as a 64 × 64 grayscale image: 4,096 numbers from 0 (black) to 255 (white). This shoe itself is excluded from the search results.")),
+                div(strong("Average Shoe"),
+                    p("The pixel-by-pixel average of all catalogue photos. Sharp areas are where most shoes look alike; blurry areas are where they differ. Every shoe is described by how it differs from this image.")),
+                div(strong("PCA Reconstruction"),
+                    p(HTML("The selected shoe rebuilt from only K numbers: Average + score<sub>1</sub> × PC<sub>1</sub> + … + score<sub>K</sub> × PC<sub>K</sub>. Fine details are lost when K is small.")),
+                    p(strong(textOutput("recon_caption", inline = TRUE))),
+                    p("Shoe Search measures distances using these same K numbers, so details missing here are also ignored by the search."))
+              )
+            ),
             h4("Top 5 Nearest Neighbors"),
             plotOutput("top5_gallery", height = "230px")
           )
@@ -598,6 +623,11 @@ server <- function(input, output, session) {
   
   output$reconstructed_shoe <- renderPlot({
     plot_shoe(reconstruct_shoe(query_data()$vector, input$K))
+  })
+    output$recon_caption <- renderText({
+    k <- input$K
+    sprintf("K = %d keeps %.1f%% of the pixel variation across catalogue photos.",
+            k, cumsum(pca_data$var_explained)[k])
   })
   
   output$top5_gallery <- renderPlot({
