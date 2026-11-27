@@ -159,7 +159,7 @@ reconstruct_shoe <- function(vector, K) {
   as.numeric(pca_data$x_bar + V %*% q)
 }
 
-plot_shoe <- function(vector, title = "", signed = FALSE) {
+plot_shoe <- function(vector, title = "", signed = FALSE, bottom = "") {
   m <- matrix(as.numeric(vector), IMAGE_SIDE, IMAGE_SIDE)
   z <- t(m[IMAGE_SIDE:1L, , drop = FALSE])
   if (signed) {
@@ -171,13 +171,14 @@ plot_shoe <- function(vector, title = "", signed = FALSE) {
     pal <- gray(seq(0, 1, length.out = 256))
     lims <- c(0, 255)
   }
-  old <- par(mar = c(0.5, 0.5, if (nzchar(title)) 2.5 else 0.5, 0.5))
+  old <- par(mar = c(if (nzchar(bottom)) 2 else 0.5, 0.5, if (nzchar(title)) 2.5 else 0.5, 0.5))
   on.exit(par(old))
   image(
     seq_len(IMAGE_SIDE), seq_len(IMAGE_SIDE), z,
     col = pal, zlim = lims, axes = FALSE,
     xlab = "", ylab = "", asp = 1, main = title, useRaster = TRUE
   )
+  if (nzchar(bottom)) mtext(bottom, side = 1, line = 0.6, cex = 0.9)
 }
 
 # 2. K-POP LYRICS DATA (DATA 1) ------------------------------
@@ -271,6 +272,15 @@ ui <- page_navbar(
     }
     .d1-method-grid > div { padding: 12px; background: #f7fafc; border-radius: 8px; }
     .d1-example-table { margin-top: 12px; }
+    .pca-flow {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 10px; margin: 10px 0;
+    }
+    .pca-flow > div {
+      padding: 10px 12px; background: #f7fafc; border-left: 4px solid #18BC9C;
+      border-radius: 8px; font-size: 0.92rem;
+    }
+    .pca-flow .step-tag { display: block; color: #18BC9C; font-weight: 700; font-size: 0.8rem; }
   "))),
   
   # TAB 1: PCA
@@ -284,9 +294,18 @@ ui <- page_navbar(
                      value = shoes_meta$id[1],
                      min = min(shoes_meta$id), max = max(shoes_meta$id), step = 1),
         sliderInput("K", "Number of Principal Components (K)",
-                    min = 1, max = K_MAX, value = min(20L, K_MAX), step = 1)
+                    min = 1, max = K_MAX, value = min(20L, K_MAX), step = 1),
+        hr(),
+        p(strong("Try a tied vote")),
+        p(class = "shoe-caption",
+          "At K = 20, these shoes get a 2 : 2 : 1 vote. Click one to load it (K is set to 20) and see how the tie is broken under the Top 5 table."),
+        div(
+          actionButton("tie_26", "ID 26", class = "btn-outline-primary btn-sm"),
+          actionButton("tie_43", "ID 43", class = "btn-outline-primary btn-sm")
+        )
       ),
       navset_tab(
+        id = "pca_tabs",
         nav_panel(
           "Shoe Search",
           card(
@@ -296,7 +315,32 @@ ui <- page_navbar(
             layout_columns(
               col_widths = c(5, 7),
               card(card_header("Best Match"), plotOutput("best_match", height = "260px")),
-              card(card_header("Top 5 Similar Shoes"), tableOutput("top5"))
+              card(card_header("Top 5 Similar Shoes"), tableOutput("top5"), uiOutput("vote_breakdown"))
+            ),
+            tags$details(
+              class = "d1-method-details",
+              tags$summary("How are the distance and the predicted category decided?"),
+              p(strong("1. Distance: "),
+                "Every shoe is turned into K numbers (its PC scores). The distance between the selected shoe (q) and a catalogue shoe (s) is the straight-line (Euclidean) distance between their K scores:"),
+              p(HTML("Distance = &radic;[ (q<sub>1</sub> &minus; s<sub>1</sub>)&sup2; + (q<sub>2</sub> &minus; s<sub>2</sub>)&sup2; + &hellip; + (q<sub>K</sub> &minus; s<sub>K</sub>)&sup2; ]")),
+              p("A smaller distance means a more similar shoe. The selected shoe itself is left out, so it cannot match itself. Because only the first K scores are used, the distances and even the ranking can change when you move the K slider."),
+              p(strong("2. Majority vote: "),
+                "The 5 nearest shoes each vote for their own category, and the category with the most votes is the prediction."),
+              p(strong("3. Tie-break: "),
+                "If two categories get the same number of votes, the one whose shoe appears first in the ranking (i.e., the closest shoe) wins."),
+              tags$table(
+                class = "table table-sm table-striped d1-example-table",
+                tags$thead(tags$tr(tags$th("Top 5 categories (rank 1 → 5)"), tags$th("Votes"), tags$th("Prediction"))),
+                tags$tbody(
+                  tags$tr(tags$td("Shoes, Shoes, Slippers, Boots, Boots"),
+                          tags$td("Shoes 2 · Boots 2 · Slippers 1"),
+                          tags$td("Shoes (tied with Boots, but Shoes is at rank 1)")),
+                  tags$tr(tags$td("Slippers, Boots, Shoes, Shoes, Boots"),
+                          tags$td("Boots 2 · Shoes 2 · Slippers 1"),
+                          tags$td("Boots (first tied shoe is at rank 2; Slippers is closest but has only 1 vote)"))
+                )
+              ),
+              p(class = "shoe-caption", "Illustrative examples. For real tied votes, click ID 26 or ID 43 under 'Try a tied vote' in the sidebar.")
             ),
             hr(),
             h4("PCA Image Comparison"),
@@ -332,12 +376,33 @@ ui <- page_navbar(
               )
             ),
             h4("Top 5 Nearest Neighbors"),
-            plotOutput("top5_gallery", height = "230px")
+            plotOutput("top5_gallery", height = "260px"),
+            p(class = "shoe-caption",
+              "Distance = Euclidean distance to the selected shoe using its first K PC scores (smaller = more similar).")
           )
         ),
         nav_panel(
           "Explain PCA",
-          p("Explore how the photo selected in Shoe Search is represented and matched."),
+          card(
+            card_header("The big picture: how Shoe Search works"),
+            p(strong("Key idea: "),
+              "Instead of comparing 4,096 pixels, the app compares a few numbers (K PC scores) that capture the main ways shoes differ from each other. The steps below follow the photo selected in Shoe Search through this process."),
+            div(
+              class = "pca-flow",
+              div(span(class = "step-tag", "START"),
+                  "A photo is a 64 × 64 grayscale image = 4,096 numbers (0 = black, 255 = white)."),
+              div(span(class = "step-tag", "STEPS 1–2"),
+                  "Subtract the average shoe, leaving only how this shoe differs from a typical one."),
+              div(span(class = "step-tag", "STEP 4"),
+                  "PCA learns the most common patterns of difference across the catalogue (eigenshoes)."),
+              div(span(class = "step-tag", "STEPS 5–6"),
+                  "Describe the shoe with K scores, one per pattern; rebuilding the photo from them shows what is kept."),
+              div(span(class = "step-tag", "SEARCH · STEP 3"),
+                  "Compare K scores with every catalogue shoe; the 5 nearest vote on the category."),
+              div(span(class = "step-tag", "STEP 7"),
+                  "Choose K: enough PCs to tell categories apart, without keeping unnecessary detail.")
+            )
+          ),
           layout_columns(
             col_widths = c(6, 6),
             card(
@@ -365,6 +430,31 @@ ui <- page_navbar(
               width = "420px"
             ),
             p(class = "shoe-caption", textOutput("pc_disc_text")),
+            tags$details(
+              class = "d1-method-details",
+              tags$summary("How to read this 3D map"),
+              tags$ul(
+                tags$li(strong("Each dot is one catalogue shoe, "),
+                        "placed by its scores on the 3 chosen PCs and colored by category. Dots that are close together look similar on these 3 patterns."),
+                tags$li(strong("Black diamond: "), "the selected shoe. ",
+                        strong("Red open circles: "), "its Top 5 matches from Shoe Search."),
+                tags$li(strong("Why the Top 5 may not look closest here: "),
+                        "the search measures distance with all K PCs, but this map shows only 3 of them. Two shoes can overlap on these 3 axes and still differ on the others, or the reverse."),
+                tags$li(
+                  strong("Axis options:"),
+                  tags$ul(
+                    tags$li(strong("Standard: "),
+                            "PC1–PC3, the PCs that capture the most overall pixel variation. Variation is not the same as category separation (for example, PC1 may mostly reflect overall brightness)."),
+                    tags$li(strong("Best overall separation: "),
+                            "the 3 PCs whose category averages differ most compared with the spread within each category (ANOVA F-statistic)."),
+                    tags$li(strong("Best for [category]: "),
+                            "the 3 PCs that best separate one category from all other shoes (|t|-statistic).")
+                  )
+                ),
+                tags$li(strong("Interaction: "),
+                        "drag to rotate, scroll to zoom, hover over a dot to see its ID. Click a category in the legend to hide it; double-click to show only that category.")
+              )
+            ),
             plotlyOutput("pca_step3", height = "500px"),
             hr(),
             h5("Category Separation Strength (PC1–PC20)"),
@@ -393,7 +483,19 @@ ui <- page_navbar(
           ),
           card(
             card_header("Step 5 | Query scores"),
-            p("The first K PCA coordinates used to calculate nearest-neighbor distances."),
+            p("The first K PCA coordinates used to calculate nearest-neighbor distances. These K numbers are all that Shoe Search knows about the selected shoe."),
+            tags$details(
+              class = "d1-method-details",
+              tags$summary("How to read a score"),
+              tags$ul(
+                tags$li(strong("Score: "),
+                        "how strongly the eigenshoe pattern of that PC (Step 4) appears in this shoe. It measures how well the difference image in Step 2 lines up with that pattern."),
+                tags$li(strong("Sign: "),
+                        "read it with the colors in Step 4 (the Meaning column applies that rule to each score). A score near 0 means the pattern barely matters for this shoe."),
+                tags$li(strong("Catalogue percentile: "),
+                        "raw scores are not comparable across PCs (PC1 scores spread much wider than later PCs), so each score is compared with the catalogue. 95% means this shoe's score is higher than or equal to that of 95% of catalogue shoes on that PC.")
+              )
+            ),
             tableOutput("pca_step5_table")
           ),
           card(
@@ -402,11 +504,20 @@ ui <- page_navbar(
             plotOutput("pca_step6", height = "300px")
           ),
           card(
-            card_header("Step 7 | Find Best K (Leave-One-Out Accuracy)"),
+            card_header("Step 7 | Choosing K: picture quality vs. classification accuracy"),
+            p("There are two ways to judge K. ",
+              strong("Picture quality"), " (left): how much of the pixel variation the first K PCs keep. ",
+              strong("Classification accuracy"), " (right): how often the 5 nearest neighbors guess a shoe's category correctly. ",
+              "A larger K always keeps more variation, but later PCs mostly add fine details, so accuracy can stop improving or even drop."),
             p("Each catalogue shoe is classified by its 5 nearest neighbors across K = 1 to 100."),
             actionButton("run_acc", "Compute / Load Accuracy", class = "btn-primary"),
-            plotOutput("acc_plot", height = "400px"),
-            textOutput("acc_text")
+            layout_columns(
+              col_widths = c(6, 6),
+              plotOutput("var_plot", height = "400px"),
+              plotOutput("acc_plot", height = "400px")
+            ),
+            textOutput("acc_text"),
+            uiOutput("k_compare")
           )
         )
       )
@@ -607,6 +718,35 @@ server <- function(input, output, session) {
   
   output$top5 <- renderTable(shoe_search()$top5, striped = TRUE, bordered = TRUE, spacing = "s")
   
+  output$vote_breakdown <- renderUI({
+    res <- shoe_search()
+    cats <- res$top5$Category
+    counts <- table(factor(cats, levels = unique(cats)))   # rank order of first appearance
+    max_n <- max(counts)
+    tied <- names(counts)[counts == max_n]
+    vote_text <- paste(sprintf("%s %d", names(counts), as.integer(counts)), collapse = " · ")
+    
+    explain <- if (length(tied) > 1L) {
+      sprintf("Tie between %s (%d votes each). %s is chosen because its closest shoe is at rank #%d, ahead of the other tied categories.",
+              paste(tied, collapse = " and "), max_n, res$prediction, match(res$prediction, cats))
+    } else {
+      sprintf("%s has the most votes (%d of %d).", res$prediction, max_n, NEIGHBORS)
+    }
+    
+    tagList(
+      p(strong("Votes: "), vote_text),
+      p(class = "shoe-caption", explain)
+    )
+  })
+  
+  load_tie_example <- function(id) {
+    updateSliderInput(session, "K", value = 20)
+    updateNumericInput(session, "cat_id", value = id)
+    nav_select("pca_tabs", "Shoe Search")
+  }
+  observeEvent(input$tie_26, load_tie_example(26))
+  observeEvent(input$tie_43, load_tie_example(43))
+  
   output$best_match <- renderPlot({
     id <- shoe_search()$best_id
     row <- match(id, shoes_meta$id)
@@ -636,7 +776,8 @@ server <- function(input, output, session) {
     on.exit(par(old))
     for (j in seq_len(NEIGHBORS)) {
       row <- match(top5$ID[j], shoes_meta$id)
-      plot_shoe(pca_data$X[row, ], paste0("#", j, " ID ", top5$ID[j], "\n", top5$Category[j]))
+      plot_shoe(pca_data$X[row, ], paste0("#", j, " ID ", top5$ID[j], "\n", top5$Category[j]),
+                bottom = sprintf("Distance = %.2f", top5$Distance[j]))
     }
   })
   
@@ -782,7 +923,18 @@ server <- function(input, output, session) {
   
   output$pca_step5_table <- renderTable({
     s <- shoe_search()$query_scores
-    data.frame(PC = paste0("PC", seq_along(s)), Score = round(s, 2))
+    pct <- vapply(seq_along(s), function(k) 100 * mean(pca_data$scores[, k] <= s[k]), numeric(1))
+    data.frame(
+      PC = paste0("PC", seq_along(s)),
+      Score = round(s, 2),
+      `Catalogue percentile` = sprintf("%.0f%%", pct),
+      Meaning = ifelse(
+        seq_along(s) > 10L, "(eigenshoe not shown in Step 4)",
+        ifelse(s >= 0, "Red areas brighter, blue areas darker",
+               "Red areas darker, blue areas brighter")
+      ),
+      check.names = FALSE
+    )
   }, striped = TRUE, spacing = "s")
   
   output$pca_step6 <- renderPlot({
@@ -840,6 +992,41 @@ server <- function(input, output, session) {
       "Selected K = %d: %.1f%% accuracy. Best K = %d: %.1f%% accuracy.",
       input$K, 100 * res$overall[input$K], best_k, 100 * res$overall[best_k]
     )
+  })
+  
+  output$var_plot <- renderPlot({
+    cum <- cumsum(pca_data$var_explained)
+    k <- input$K
+    plot(
+      seq_len(K_MAX), pca_data$var_explained, type = "h", col = "#BDC3C7", lwd = 2,
+      ylim = c(0, 100), xlab = "Number of PCs (K)", ylab = "Variance explained (%)",
+      main = "Pixel Variation Kept by K PCs"
+    )
+    lines(seq_len(K_MAX), cum, lwd = 3, col = "#2C3E50")
+    abline(v = k, col = "red", lty = 3)
+    points(k, cum[k], col = "red", pch = 19)
+    legend(
+      "right", bg = "white", cex = 0.8,
+      legend = c("Cumulative", "Each PC", paste("Selected K =", k)),
+      col = c("#2C3E50", "#BDC3C7", "red"),
+      lty = c(1, 1, 3), lwd = c(3, 2, 1)
+    )
+  })
+  
+  output$k_compare <- renderUI({
+    k <- input$K
+    cum <- cumsum(pca_data$var_explained)
+    base <- sprintf("K = %d keeps %.1f%% of the pixel variation.", k, cum[k])
+    res <- accuracy_result()
+    if (is.null(res)) {
+      return(p(class = "shoe-caption", base,
+               " Click the button above to compare this with classification accuracy."))
+    }
+    best_k <- which.max(res$overall)
+    p(class = "shoe-caption", sprintf(
+      "%s Accuracy is highest at K = %d (%.1f%%), where %.1f%% of the variation is kept. Beyond that point, extra PCs still improve the reconstruction but do not improve classification.",
+      base, best_k, 100 * res$overall[best_k], cum[best_k]
+    ))
   })
   
   # DATA 1 TAB
