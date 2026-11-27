@@ -301,8 +301,12 @@ ui <- page_navbar(
           "At K = 20, these shoes get a 2 : 2 : 1 vote. Click one to load it (K is set to 20) and see how the tie is broken under the Top 5 table."),
         div(
           actionButton("tie_26", "ID 26", class = "btn-outline-primary btn-sm"),
-          actionButton("tie_43", "ID 43", class = "btn-outline-primary btn-sm")
-        )
+          actionButton("tie_43", "ID 43", class = "btn-outline-primary btn-sm"),
+          actionButton("tie_575", "ID 575", class = "btn-outline-primary btn-sm"),
+          actionButton("tie_2", "ID 2", class = "btn-outline-primary btn-sm")
+        ),
+        p(class = "shoe-caption",
+          "ID 575 and ID 2: the nearest shoe's category loses because it has only 1 vote (ID 2 ends up wrong).")
       ),
       navset_tab(
         id = "pca_tabs",
@@ -746,6 +750,8 @@ server <- function(input, output, session) {
   }
   observeEvent(input$tie_26, load_tie_example(26))
   observeEvent(input$tie_43, load_tie_example(43))
+  observeEvent(input$tie_575, load_tie_example(575))
+  observeEvent(input$tie_2, load_tie_example(2))
   
   output$best_match <- renderPlot({
     id <- shoe_search()$best_id
